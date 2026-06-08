@@ -111,6 +111,32 @@ appended.
 If the Claude Agent SDK is **not** installed, the CLI prints clear install
 instructions and exits with a non-zero status — it does not crash with a traceback.
 
+## Run the dashboard (Streamlit GUI)
+
+A single-page web dashboard renders everything for one ticker — the `cross_check`
+verdict, the price chart + indicators + signals, blended sentiment + headlines,
+congressional/insider trades, and analyst ratings/targets/filings — in five tabs.
+It is a thin Layer-2 presentation surface: it calls the existing server **logic
+functions** and renders their results, adding no business logic.
+
+```bash
+# install the optional UI extra (adds streamlit)
+pip install -e ".[ui]"        # or ".[dev]" which already includes it
+
+# launch (console script)
+makecrazypenny-dashboard       # add streamlit flags after, e.g. --server.port 8502
+
+# or directly
+streamlit run makecrazypenny/ui/dashboard.py
+```
+
+Then open the printed URL (default http://localhost:8501), enter a ticker in the
+sidebar, and click **Analyze**. No data is fetched until you do; results are cached
+for ~5 minutes. The dashboard needs **no** Claude Agent SDK (it talks to Layer 1/0
+directly) and no API keys for the free providers (yfinance / EDGAR / StockWatcher);
+add keys to `.env` to populate the keyed panels. `makecrazypenny/ui/dashboard.py`
+stays import-safe without Streamlit installed, so it never affects the test suite.
+
 ## Run tests
 
 Tests are deterministic and offline (no network); `respx`/monkeypatching stub all

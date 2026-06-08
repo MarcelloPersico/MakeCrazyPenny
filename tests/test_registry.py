@@ -325,6 +325,50 @@ async def test_all_providers_failed_when_all_skipped(tmp_path):
     assert wrongcap.calls == 0  # never called (unsupported)
 
 
+async def test_all_providers_failed_carries_reasons(tmp_path):
+    """``AllProvidersFailed`` records per-provider skip reasons and missing keys."""
+    settings = make_settings(tmp_path, {"quote": ["nokey", "wrongcap", "boom"]})
+    registry = ProviderRegistry(settings)
+    registry.register(
+        FakeProvider("nokey", {"quote"}, error=MissingApiKey("nokey", "NOKEY_API_KEY"))
+    )
+    registry.register(FakeProvider("wrongcap", {"ohlcv"}, result={"px": 0}))
+    registry.register(FakeProvider("boom", {"quote"}, error=RuntimeError("kaboom")))
+
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        await registry.fetch("quote", symbol="AAPL")
+
+    reasons = excinfo.value.reasons
+    assert reasons["nokey"] == "missing API key: NOKEY_API_KEY"
+    assert reasons["wrongcap"] == "capability not supported"
+    assert "kaboom" in reasons["boom"]
+    # The actionable env-var list is exposed for friendly UI/agent output.
+    assert excinfo.value.missing_api_keys == ["NOKEY_API_KEY"]
+    # ...and folded into the human-readable message.
+    assert "NOKEY_API_KEY" in str(excinfo.value)
+
+
+async def test_api_key_is_redacted_from_failure_reason(tmp_path):
+    """A token embedded in a provider exception must never reach reasons/message."""
+    settings = make_settings(tmp_path, {"quote": ["leaky"]})
+    registry = ProviderRegistry(settings)
+    secret = "FAKEKEYTESTONLY123"
+    registry.register(
+        FakeProvider(
+            "leaky",
+            {"quote"},
+            error=RuntimeError(f"403 Forbidden for url 'https://api/quote?token={secret}'"),
+        )
+    )
+
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        await registry.fetch("quote", symbol="AAPL")
+
+    assert secret not in excinfo.value.reasons["leaky"]
+    assert secret not in str(excinfo.value)
+    assert "token=***" in excinfo.value.reasons["leaky"]
+
+
 async def test_unknown_capability_raises_all_providers_failed(tmp_path):
     """A capability with no chain entry resolves to an empty chain => failure."""
     settings = make_settings(tmp_path, {"quote": ["p"]})

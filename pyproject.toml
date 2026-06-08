@@ -29,15 +29,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = [
+    "streamlit>=1.30",
+]
 dev = [
     "pytest",
     "pytest-asyncio",
     "respx",
     "ruff",
+    "streamlit>=1.30",
 ]
 
 [project.scripts]
 makecrazypenny = "makecrazypenny.orchestration.main:cli"
+makecrazypenny-dashboard = "makecrazypenny.ui.launch:launch"
 
 [project.urls]
 Homepage = "https://github.com/persico-mlo/makecrazypenny"

@@ -32,12 +32,37 @@ class AllProvidersFailed(ProviderError):
     chain failed, was skipped, or was unavailable.
 
     The offending ``capability`` is stored on the instance so callers/agents
-    can report which capability could not be served.
+    can report which capability could not be served. ``reasons`` maps each
+    attempted provider name to a short explanation of why it was skipped or
+    failed (e.g. ``"missing API key: FINNHUB_API_KEY"``, ``"circuit open"``),
+    which is folded into the message and exposed for friendlier UI/agent output.
     """
 
-    def __init__(self, capability: str) -> None:
+    def __init__(self, capability: str, reasons: dict[str, str] | None = None) -> None:
         self.capability = capability
-        super().__init__(f"All providers failed for capability: {capability!r}")
+        self.reasons: dict[str, str] = dict(reasons or {})
+        message = f"All providers failed for capability: {capability!r}"
+        if self.reasons:
+            detail = "; ".join(f"{name}: {why}" for name, why in self.reasons.items())
+            message = f"{message} ({detail})"
+        super().__init__(message)
+
+    @property
+    def missing_api_keys(self) -> list[str]:
+        """De-duplicated env-var names of providers skipped for a missing key.
+
+        Empty when no attempted provider was skipped purely because its API key
+        was absent. Useful for telling a user exactly which keys would unlock the
+        capability, rather than surfacing a generic "all providers failed".
+        """
+        marker = "missing API key:"
+        keys: list[str] = []
+        for why in self.reasons.values():
+            if marker in why:
+                env = why.split(marker, 1)[1].strip()
+                if env and env not in keys:
+                    keys.append(env)
+        return keys
 
 
 class MissingApiKey(ProviderError):

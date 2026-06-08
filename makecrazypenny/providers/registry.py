@@ -16,6 +16,7 @@ from typing import Any
 
 from ..core.config import Settings, default_ttl
 from ..core.errors import AllProvidersFailed, MissingApiKey
+from ..core.redact import redact_secrets
 from .base import PROVIDER_REGISTRY, Provider
 from .cache import TTLCache
 from .circuit import CircuitBreaker
@@ -116,13 +117,19 @@ class ProviderRegistry:
         """
         chain = self.settings.CAPABILITY_CHAINS.get(capability, [])
         effective_ttl = ttl if ttl is not None else default_ttl(capability)
+        reasons: dict[str, str] = {}
 
         for name in chain:
             provider = self._providers.get(name)
-            if provider is None or capability not in provider.supported:
+            if provider is None:
+                reasons[name] = "not registered"
+                continue
+            if capability not in provider.supported:
+                reasons[name] = "capability not supported"
                 continue
             circuit = self._circuits.get(name)
             if circuit is not None and not circuit.allow():
+                reasons[name] = "circuit open"
                 continue
 
             try:
@@ -135,19 +142,26 @@ class ProviderRegistry:
                     ttl=effective_ttl,
                     factory=lambda p=provider: p.fetch(capability, **params),
                 )
-            except (MissingApiKey, NotImplementedError):
-                # Configuration/support fact: skip silently, do not trip breaker.
+            except MissingApiKey as exc:
+                # Configuration fact: skip silently, do not trip the breaker.
+                reasons[name] = f"missing API key: {exc.env_var}"
                 continue
-            except Exception:
+            except NotImplementedError:
+                reasons[name] = "capability not implemented"
+                continue
+            except Exception as exc:
                 if circuit is not None:
                     circuit.record_failure()
+                # Redact any API key embedded in the message (e.g. a failing URL
+                # carries `?token=...`) before it reaches reasons/UI/logs.
+                reasons[name] = redact_secrets(f"{type(exc).__name__}: {exc}")
                 continue
 
             if circuit is not None:
                 circuit.record_success()
             return {"provider": name, "data": result.value, "cached": result.cached}
 
-        raise AllProvidersFailed(capability)
+        raise AllProvidersFailed(capability, reasons)
 
 
 __all__ = ["ProviderRegistry"]

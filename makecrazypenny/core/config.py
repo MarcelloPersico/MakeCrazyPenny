@@ -199,11 +199,13 @@ class Settings:
             "FMP_API_KEY": self.fmp_api_key,
             "MARKETAUX_API_KEY": self.marketaux_api_key,
         }
-        value = mapping.get(env_var)
-        if value is None:
-            # Unknown var name: fall back to a live environment lookup.
-            value = os.environ.get(env_var)
-        return value or None
+        if env_var in mapping:
+            # A known key: the injected Settings is authoritative. An explicit
+            # None means "disabled" — do NOT silently fall back to ambient env
+            # (that would defeat dependency injection and test isolation).
+            return mapping[env_var] or None
+        # Unknown var name: fall back to a live environment lookup.
+        return os.environ.get(env_var) or None
 
     def resolve_cache_dir(self) -> Path:
         """Resolve and create the cache directory, returning its ``Path``."""

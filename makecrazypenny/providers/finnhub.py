@@ -144,7 +144,7 @@ class FinnhubProvider(Provider):
 
         Args:
             path: Endpoint path beginning with ``/`` (e.g. ``"/quote"``).
-            params: Query parameters (the API token is added automatically).
+            params: Query parameters (the API token is sent as a header).
 
         Returns:
             The decoded JSON body (dict or list).
@@ -154,10 +154,13 @@ class FinnhubProvider(Provider):
         """
         import httpx  # lazy import (see CONTRACT.md §2.2)
 
-        query = dict(params)
-        query["token"] = self.api_key()
-        async with httpx.AsyncClient(base_url=_BASE_URL, timeout=20.0) as client:
-            response = await client.get(path, params=query)
+        # Authenticate via header, NOT a `?token=` query param, so the key never
+        # appears in a URL (and thus never in an httpx error message / log).
+        headers = {"X-Finnhub-Token": self.api_key()}
+        async with httpx.AsyncClient(
+            base_url=_BASE_URL, timeout=20.0, headers=headers
+        ) as client:
+            response = await client.get(path, params=dict(params))
             response.raise_for_status()
             return response.json()
 
