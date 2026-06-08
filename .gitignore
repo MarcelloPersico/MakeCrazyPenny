@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Local tooling scaffolding (machine-specific, not project source)
+.serena/
+graphify-out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
