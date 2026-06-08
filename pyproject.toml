@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "makecrazypenny"
+version = "0.1.0"
+description = "Agentic financial-analysis platform: a Claude mother orchestrator over MCP capability servers. Informational only; not investment advice."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "MakeCrazyPenny", email = "persico.mlo@gmail.com" }]
+keywords = ["mcp", "claude", "agent", "finance", "stocks", "analysis"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+dependencies = [
+    "claude-agent-sdk",
+    "yfinance",
+    "pandas",
+    "ta",
+    "httpx",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+    "ruff",
+]
+
+[project.scripts]
+makecrazypenny = "makecrazypenny.orchestration.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/persico-mlo/makecrazypenny"
+
+[tool.hatch.build.targets.wheel]
+packages = ["makecrazypenny"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/makecrazypenny",
+    "/tests",
+    "/README.md",
+    "/CONTRACT.md",
+    "/plan.md",
+    "/.env.example",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
