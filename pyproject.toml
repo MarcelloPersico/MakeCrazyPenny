@@ -20,6 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "mcp>=1.2",
     "claude-agent-sdk",
     "yfinance",
     "pandas",
@@ -42,6 +43,7 @@ dev = [
 
 [project.scripts]
 makecrazypenny = "makecrazypenny.orchestration.main:cli"
+makecrazypenny-mcp = "makecrazypenny.mcp_server:main"
 makecrazypenny-dashboard = "makecrazypenny.ui.launch:launch"
 
 [project.urls]

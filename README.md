@@ -10,13 +10,28 @@
 
 ## What it is
 
-MakeCrazyPenny is an agentic financial-analysis platform. A **mother orchestrator**
-agent (Claude, via the Claude Agent SDK) plans an analysis of a stock symbol,
-delegates to specialized sub-agents (technical, sentiment, congressional-trade,
-expert-report), and synthesizes a single **cross-checked** report. Every capability
-is exposed over the Model Context Protocol (MCP), so any MCP-capable host can drive
-it. See [`plan.md`](./plan.md) for the original design and
-[`CONTRACT.md`](./CONTRACT.md) for the authoritative build specification.
+MakeCrazyPenny is an agentic financial-analysis platform that makes an **autonomous
+trade decision** — **BUY (go long)**, **SHORT**, or **AVOID** — for a stock symbol,
+through an adversarial **bull-vs-bear debate** that an orchestrator/judge adjudicates.
+
+It ships as a **stdio MCP server**: you mount it in an MCP host (Claude Desktop or
+Claude Code) and the **host's own model — your subscription — runs the debate**. No
+Anthropic API key, nothing billed per token. The server provides the host with
+deterministic, AI-free **tools** (evidence from *all* the APIs + a quant baseline +
+`finalize_decision`) and the bull/bear/judge **prompts** to run. The `decide` prompt
+orchestrates the whole flow: gather evidence → bull argues long → bear argues
+short/avoid → rebuttals → judge weighs argument quality and decides, with a
+conviction, sizing, rationale, risks, and an invalidation condition.
+
+Under the debate sits a **pure, deterministic quant backbone**, so the `decide` tool
+(and the CLI) always produce a real decision with *no model call at all*. A classic
+**cross-checked research report** mode also remains. See [`plan.md`](./plan.md) §8 for
+the design and [`CONTRACT.md`](./CONTRACT.md) §10.3–§10.4 for the build spec.
+
+> **Why an MCP server instead of the API?** So the AI runs on your existing Claude
+> subscription via the host, not a metered API key. MCP "sampling" would be the ideal
+> mechanism but no Claude host implements it yet, so the debate is exposed as MCP
+> **prompts** the host's model executes (with the server's tools for evidence).
 
 ## Architecture
 
@@ -42,6 +57,28 @@ The Layer-2 orchestrator (`orchestration/agents.py`) defines four specialists:
 | `report-checker` | `claude-sonnet-4-6` | `mcp__reports__*`, `mcp__synthesis__cross_check`, `mcp__orchestration__spawn_analyst` |
 
 The mother orchestrator runs on `claude-opus-4-8` with all six MCP servers wired in.
+
+**Decision layer** (`mcp_server.py` + `orchestration/debate.py`). The autonomous
+buy/short/avoid decision is produced by an adversarial debate **run by the host's
+model** through the MCP server:
+
+| MCP prompt | Role (host's model plays it) |
+|------------|------------------------------|
+| `decide` | Orchestrates the whole flow: evidence → bull → bear → rebuttals → judge → `finalize_decision`. |
+| `bull_case` | Argues the strongest case to go long (BUY). |
+| `bear_case` | Argues the strongest case to short or avoid. |
+| `judge` | Weighs argument quality + evidence, then decides. |
+
+| MCP tool (deterministic, AI-free) | Returns |
+|-----------------------------------|---------|
+| `decide` | Quant baseline `TradeDecision` (BUY/SHORT/AVOID + conviction + factors). |
+| `gather_evidence` | Full evidence dossier + quant score. |
+| `technical_analysis` / `sentiment_analysis` / `congress_activity` / `analyst_reports` / `cross_check` | Per-domain evidence. |
+| `finalize_decision` | Merges the host's debated verdict with the quant backbone into the canonical decision. |
+
+The engine `orchestration/debate.py` (`gather_evidence → score_evidence →
+decide_from_scores`) is pure and AI-free — it's the deterministic baseline the host's
+judgment refines. See [`plan.md`](./plan.md) §8 and [`CONTRACT.md`](./CONTRACT.md) §10.4.
 
 **Import safety.** Providers and servers import cleanly *without* the optional heavy
 libraries (`yfinance`, `pandas`, `ta`) or the Claude Agent SDK present, and without
@@ -86,30 +123,62 @@ provider in that capability's chain.
 | `MARKETAUX_API_KEY` | Company news |
 | `MCP_CACHE_DIR` | On-disk L2 cache + persisted alert state (defaults to a temp dir) |
 
-Running the **orchestrator CLI** additionally requires the Claude Agent SDK to be
-installed (it is a declared dependency) and a Claude API key configured in your
-environment, per the SDK's own conventions.
+The decision **tools and prompts need no API key** — the host's model does the
+reasoning. The legacy `report` mode (and `spawn_analyst`) additionally require the
+Claude Agent SDK and a Claude API key, per the SDK's conventions.
 
-## Run the CLI
+## Run as an MCP server (recommended)
+
+This is the primary way to use MakeCrazyPenny: mount it in an MCP host and run the
+debate on **your own subscription**.
 
 ```bash
-# Module form
+# Mount in Claude Code (after `pip install -e .`)
+claude mcp add makecrazypenny -- makecrazypenny-mcp
+
+# …or run the stdio server directly
+makecrazypenny-mcp
+python -m makecrazypenny.mcp_server
+```
+
+For Claude Desktop, add to its MCP config:
+
+```json
+{
+  "mcpServers": {
+    "makecrazypenny": { "command": "makecrazypenny-mcp" }
+  }
+}
+```
+
+Then, in the host, run the **`decide`** prompt for a symbol (e.g. `AAPL`). The host's
+model gathers evidence via the tools, argues bull vs bear, judges, and calls
+`finalize_decision` to produce the canonical verdict. You can also run the
+`bull_case` / `bear_case` / `judge` prompts individually, or call any tool directly
+(e.g. `decide AAPL` for the instant quant baseline).
+
+## Run the CLI (deterministic quant decision)
+
+The CLI gives the AI-free quant decision instantly — handy for scripting/CI:
+
+```bash
+# Autonomous quant decision (default mode): BUY / SHORT / AVOID + conviction
 python -m makecrazypenny.orchestration.main AAPL
+makecrazypenny NVDA              # console script (installed by `pip install -e .`)
 
-# Console script (installed by `pip install -e .`)
-makecrazypenny AAPL --depth 2
+# Classic cross-checked research report (needs the Claude Agent SDK)
+python -m makecrazypenny.orchestration.main AAPL --mode report --depth 2
 ```
 
 ```
-usage: makecrazypenny [-h] [--depth DEPTH] SYMBOL
+usage: makecrazypenny [-h] [--mode {decide,report}] [--depth DEPTH] SYMBOL
 ```
 
-The CLI normalizes the symbol (`$aapl` → `AAPL`), runs the mother orchestrator over
-it, and prints the cross-checked report with the not-investment-advice disclaimer
-appended.
-
-If the Claude Agent SDK is **not** installed, the CLI prints clear install
-instructions and exits with a non-zero status — it does not crash with a traceback.
+`decide` mode (default) normalizes the symbol (`$aapl` → `AAPL`) and prints the
+verdict, conviction, bull/bear cases, risks, the quant factor breakdown, and a tip to
+run the full debate via the MCP server — always with the not-investment-advice
+disclaimer. It needs **no SDK or API key**. `report` mode still drives the SDK
+orchestrator and exits non-zero (no traceback) if the SDK is absent.
 
 ## Run the dashboard (Streamlit GUI)
 
