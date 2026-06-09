@@ -33,6 +33,14 @@ sector's constituents and returns a stance (overweight / underweight / neutral),
 breadth, and ranked long/short ideas; the `decide_sector` prompt then debates the top
 candidates into a sector playbook. See [`plan.md`](./plan.md) §9.
 
+The decision engine is enriched with **research-backed, free-data edges** (see
+[`plan.md`](./plan.md) §10): factor signals (12-1 **momentum**, 52-week-high, **trend**,
+**value/quality**) folded into the score; a **market-regime** filter (SPY trend + vol)
+that scales exposure; **risk sizing** (ATR stops + volatility-target / half-Kelly
+position size) on every decision; a **portfolio builder** (conviction × inverse-vol,
+regime-scaled); and a **walk-forward backtest** with transaction costs and the
+**Deflated Sharpe Ratio** to guard against overfitting.
+
 > **Why an MCP server instead of the API?** So the AI runs on your existing Claude
 > subscription via the host, not a metered API key. MCP "sampling" would be the ideal
 > mechanism but no Claude host implements it yet, so the debate is exposed as MCP
@@ -180,13 +188,21 @@ makecrazypenny NVDA              # console script (installed by `pip install -e 
 makecrazypenny --sector tech --limit 12 --top 5
 makecrazypenny --sector healthcare
 
+# Market regime (risk-on/off + gross-exposure scalar) and a walk-forward backtest
+makecrazypenny --regime
+makecrazypenny --backtest AAPL
+
 # Classic cross-checked research report (needs the Claude Agent SDK)
 python -m makecrazypenny.orchestration.main AAPL --mode report --depth 2
 ```
 
 ```
-usage: makecrazypenny [-h] [--sector NAME] [--limit N] [--top N] [--mode {decide,report}] [--depth DEPTH] [SYMBOL]
+usage: makecrazypenny [-h] [--sector NAME] [--limit N] [--top N] [--regime] [--backtest] [--mode {decide,report}] [--depth DEPTH] [SYMBOL]
 ```
+
+The `decide` output now also shows the **sized trade** (stop / target / position %) and
+the **market regime**. New MCP tools: `market_regime`, `backtest`, `build_portfolio`,
+`build_sector_portfolio`.
 
 `decide` mode (default) normalizes the symbol (`$aapl` → `AAPL`) and prints the
 verdict, conviction, bull/bear cases, risks, the quant factor breakdown, and a tip to

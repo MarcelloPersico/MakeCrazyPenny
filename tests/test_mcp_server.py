@@ -41,6 +41,7 @@ async def test_tools_and_prompts_registered() -> None:
     prompts = {p.name for p in await srv.mcp.list_prompts()}
     assert {"decide", "gather_evidence", "finalize_decision", "technical_analysis"} <= tools
     assert {"list_sectors", "sector_constituents", "scan_sector"} <= tools
+    assert {"market_regime", "backtest", "build_portfolio", "build_sector_portfolio"} <= tools
     assert {"decide", "bull_case", "bear_case", "judge", "decide_sector"} == prompts
 
 
@@ -69,14 +70,23 @@ def test_decide_prompt_handles_bad_rounds() -> None:
 
 
 async def test_decide_tool_returns_quant_decision(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_gather(symbol: str, *, settings: Any = None):
-        return BULLISH_DOSSIER
+    from makecrazypenny.orchestration import debate
 
-    monkeypatch.setattr(srv, "gather_evidence", fake_gather)
+    async def fake_gather(symbol: str, *, settings: Any = None):
+        return {**BULLISH_DOSSIER, "factors": {"last_close": 100.0, "atr14": 2.0, "realized_vol": 0.25}}
+
+    async def fake_regime(*, benchmark: str = "SPY", settings: Any = None):
+        return {"regime": "risk_on", "gross_exposure": 1.0}
+
+    # decide_tool delegates to debate.decide, which uses these names.
+    monkeypatch.setattr(debate, "gather_evidence", fake_gather)
+    monkeypatch.setattr(debate, "market_regime", fake_regime)
     out = json.loads(await srv.decide_tool("$aapl"))
     assert out["symbol"] == "AAPL"
     assert out["action"] == "BUY"
     assert out["method"] == "quant"
+    assert out["sizing"]["position_pct"] > 0
+    assert out["regime"]["regime"] == "risk_on"
     assert out["disclaimer"]
 
 
@@ -92,10 +102,16 @@ async def test_gather_evidence_tool_returns_dossier_and_quant(monkeypatch: pytes
 
 
 async def test_finalize_decision_tool_applies_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    from makecrazypenny.orchestration import debate
+
     async def fake_gather(symbol: str, *, settings: Any = None):
         return BULLISH_DOSSIER
 
+    async def fake_regime(*, benchmark: str = "SPY", settings: Any = None):
+        return {"regime": "caution", "gross_exposure": 0.6}
+
     monkeypatch.setattr(srv, "gather_evidence", fake_gather)
+    monkeypatch.setattr(debate, "market_regime", fake_regime)
     out = json.loads(
         await srv.finalize_decision_tool(
             "AAPL",
@@ -192,3 +208,37 @@ def test_decide_sector_prompt_builder() -> None:
     assert "NOT investment advice" in text
     # Bad top_n must not raise.
     assert "Technology" in srv.decide_sector_prompt("tech", top_n="oops")
+
+
+# ---------------------------------------------------------------------------
+# Regime / backtest / portfolio tools
+# ---------------------------------------------------------------------------
+
+
+async def test_market_regime_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_regime(*, benchmark: str = "SPY", settings: Any = None):
+        return {"benchmark": benchmark, "regime": "risk_on", "gross_exposure": 1.0}
+
+    monkeypatch.setattr(srv, "market_regime", fake_regime)
+    out = json.loads(await srv.market_regime_tool("SPY"))
+    assert out["regime"] == "risk_on"
+    assert out["gross_exposure"] == 1.0
+
+
+async def test_backtest_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_bt(symbol: str, *, period: str = "10y", cost_bps: float = 10.0, n_trials: int = 10, settings: Any = None):
+        return {"symbol": symbol, "strategy": {"sharpe": 0.8}, "overfit_checks": {"deflated_sharpe": 0.6}}
+
+    monkeypatch.setattr(srv, "run_backtest", fake_bt)
+    out = json.loads(await srv.backtest_tool("AAPL"))
+    assert out["symbol"] == "AAPL"
+    assert out["strategy"]["sharpe"] == 0.8
+
+
+async def test_build_portfolio_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_build(symbols, *, max_positions=10, max_weight=0.25, regime=None, settings=None):
+        return {"longs": [{"symbol": s, "weight": 1.0 / len(symbols)} for s in symbols], "shorts": [], "disclaimer": "x"}
+
+    monkeypatch.setattr(srv, "build_portfolio", fake_build)
+    out = json.loads(await srv.build_portfolio_tool(["AAPL", "MSFT"], max_positions=5, max_weight=0.5))
+    assert len(out["longs"]) == 2

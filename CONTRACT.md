@@ -75,6 +75,10 @@ makecrazypenny/core/config.py       Settings + CAPABILITY_CHAINS default
 makecrazypenny/core/disclaimer.py   DISCLAIMER: str; with_disclaimer(text)->str
 makecrazypenny/core/errors.py       error taxonomy (see §6)
 makecrazypenny/core/sectors.py      curated GICS sector -> constituents map + resolver (§10.5)
+makecrazypenny/analysis/factors.py  factor signals (momentum/trend/value/quality) (§10.7.1)
+makecrazypenny/analysis/risk.py     ATR stops + vol-target/fractional-Kelly sizing (§10.7.2)
+makecrazypenny/analysis/regime.py   market-regime filter -> gross-exposure scalar (§10.7.3)
+makecrazypenny/analysis/backtest.py walk-forward backtest + deflated Sharpe (§10.7.4)
 makecrazypenny/providers/__init__.py  imports every provider module; get_registry()  [DONE]
 makecrazypenny/providers/base.py       Provider ABC + @register_provider + PROVIDER_REGISTRY
 makecrazypenny/providers/ratelimit.py  TokenBucket
@@ -102,7 +106,8 @@ makecrazypenny/orchestration/__init__.py                                      [D
 makecrazypenny/orchestration/agents.py  AgentDefinitions + build_options() (report mode)
 makecrazypenny/orchestration/debate.py  deterministic decision engine (see §10.3)
 makecrazypenny/orchestration/market.py  sector-wide scan engine (see §10.5)
-makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report | --sector)
+makecrazypenny/orchestration/portfolio.py  conviction x inverse-vol portfolio builder (§10.6)
+makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report | --sector | --regime | --backtest)
 tests/                                 mirrors source (see §11)
 ```
 
@@ -162,7 +167,7 @@ The debate-driven decision engine adds three value types (same conventions: plai
 |------|--------|
 | `DebateArgument` | `side: str` (`"bull"`/`"bear"`), `round: int`, `thesis: str`, `key_points: list[str]`, `cited_evidence: list[str]`, `conviction: float \| None` (0..1), `rebuts: list[str]` |
 | `DebateTranscript` | `symbol: str`, `rounds: int`, `arguments: list[DebateArgument]`; helpers `for_side(side)`, `latest(side)` |
-| `TradeDecision` | `symbol`, `action` (`"BUY"`/`"SHORT"`/`"AVOID"`), `direction` (`"LONG"`/`"SHORT"`/`"FLAT"`), `conviction: float` (0..1), `horizon`, `suggested_sizing`, `summary`, `rationale: list[str]`, `bull_case: list[str]`, `bear_case: list[str]`, `risks: list[str]`, `invalidation: str \| None`, `net_score`, `bull_score`, `bear_score`, `factors: list[dict]`, `method` (`"quant"`/`"debate"`), `data_quality: dict`, `transcript: DebateTranscript \| None`, `note: str \| None`, `disclaimer: str` |
+| `TradeDecision` | `symbol`, `action` (`"BUY"`/`"SHORT"`/`"AVOID"`), `direction` (`"LONG"`/`"SHORT"`/`"FLAT"`), `conviction: float` (0..1), `horizon`, `suggested_sizing`, `summary`, `rationale: list[str]`, `bull_case: list[str]`, `bear_case: list[str]`, `risks: list[str]`, `invalidation: str \| None`, `net_score`, `bull_score`, `bear_score`, `factors: list[dict]`, `method` (`"quant"`/`"debate"`), `data_quality: dict`, `sizing: dict` (stop/target/position % — §10.7.2), `regime: dict` (market regime — §10.7.3), `transcript: DebateTranscript \| None`, `note: str \| None`, `disclaimer: str` |
 | `SectorScan` | `sector`, `stance` (`"overweight"`/`"underweight"`/`"neutral"`), `n_requested`, `n_analyzed`, `net_tilt: float`, `avg_conviction: float`, `breadth: dict` (buy/short/avoid + bullish_pct/bearish_pct), `rankings: list[dict]`, `top_longs: list[dict]`, `top_shorts: list[dict]`, `errors: list[dict]`, `method`, `summary`, `disclaimer` |
 
 `TradeDecision` always carries the not-investment-advice `disclaimer` and the quant
@@ -617,6 +622,42 @@ debates the top long/short candidates and synthesizes a sector playbook (stance 
 AI-free and offline-testable; the AI debate over a scan is run by the host (the user's
 subscription), like the single-ticker flow.
 
+### 10.6 `portfolio.py` — portfolio construction
+
+`build_portfolio(symbols, *, max_positions, max_weight, regime=None) -> dict` runs the engine on
+each name, keeps the BUY/SHORT verdicts, and weights each side by **conviction × inverse-volatility**.
+Per-name caps are enforced by *iterative* clamp-and-redistribute (a single clamp+renormalize can
+push a clamped name back over the cap); the cap auto-relaxes to ≥ equal-weight when names are too
+few to fill the side. Gross exposure is scaled by the **market regime** (§10.7.3).
+`build_sector_portfolio(sector, ...)` is the sector convenience wrapper. Returns longs/shorts with
+weights, gross/net exposure, the regime, errors, and the disclaimer. AI-free; bounded concurrency.
+**MCP:** `build_portfolio`, `build_sector_portfolio`.
+
+### 10.7 `analysis/` — quantitative primitives
+
+Pure cores (operate on plain bars/dicts, unit-testable offline) + thin async fetchers (pull data
+through the Layer-0 cached registry). Research basis + ranked shortlist: **plan.md §10**.
+
+- **`factors.py` (§10.7.1)** — `factor_values(bars, fundamentals)` → momentum 12-1, 52-week-high
+  proximity, trend vs 200-DMA, realized vol (from OHLCV), plus value (E/P, B/P, FCF yield) and
+  quality (gross profitability, ROE, margins) when free fundamentals are present; also `last_close`
+  + `atr14` for sizing. `compute_factors(symbol)` fetches and computes. Folded into
+  `debate.score_evidence` as new factor categories.
+- **`risk.py` (§10.7.2)** — `atr`, `kelly_fraction_from_conviction` (half-Kelly), and
+  `position_sizing(...)` → stop/target (ATR), vol-target weight, the conservative min position %
+  (capped + regime-scaled), R-multiple. Attached to `TradeDecision.sizing`.
+- **`regime.py` (§10.7.3)** — `regime_from_bars` / `market_regime(benchmark="SPY")` → risk-on /
+  caution / risk-off + a 0..1 gross-exposure scalar (200-DMA trend, 12-1 TS momentum, vol overlay).
+  Attached to `TradeDecision.regime`; scales sizing + portfolios. **MCP:** `market_regime`.
+- **`backtest.py` (§10.7.4)** — `backtest_long_flat(bars)` walk-forward trend+momentum long/flat,
+  net of costs → CAGR/Sharpe/maxDD/hit-rate/exposure vs buy-and-hold, plus
+  `probabilistic_sharpe_ratio` and `deflated_sharpe_ratio` (Bailey & López de Prado) to discount for
+  sample length, non-normality, and trials. Only price/factor signals (free history); others
+  excluded to avoid look-ahead. **MCP:** `backtest`.
+
+The decision engine (`debate.decide` / `enrich_decision`) folds factor scores into the verdict and
+attaches `sizing` + `regime` to every `TradeDecision`.
+
 ---
 
 ## 11. Tests (`tests/`, pytest + pytest-asyncio, `asyncio_mode=auto`, NO network)
@@ -635,6 +676,8 @@ Mirror the source tree. All tests deterministic and offline.
 | `test_debate.py` | quant backbone scores bullish/bearish/thin dossiers correctly; `decide_from_scores` maps to BUY/SHORT/AVOID and a host verdict overrides; `gather_evidence` tolerates failures; `decide` is deterministic `method="quant"`; CLI output is ASCII. |
 | `test_mcp_server.py` | FastMCP tools + prompts registered (incl. sector tools + `decide_sector`); prompt builders normalize the symbol and embed the bull/bear/judge flow; `decide`/`gather_evidence`/`finalize_decision` tools return correct JSON (verdict overrides quant); sector tools resolve + scan; per-domain tools tolerate a single failure. All AI-free/offline. |
 | `test_market.py` | sector resolver (aliases/case/substring/unknown); `aggregate_scan` ranks, classifies breadth, and derives overweight/underweight/neutral stance; `scan_sector` analyses constituents (evidence monkeypatched), respects `limit`, tolerates a failed name, and errors cleanly on an unknown sector. |
+| `test_analysis.py` | factor signals (momentum/trend/52w-high/vol; value/quality extraction) on synthetic bars; ATR + half-Kelly + `position_sizing` (stops, regime scaling, FLAT=0); regime risk-on/off/caution; backtest long/flat runs + PSR/DSR monotonicity + norm CDF/PPF sanity. All pure/offline. |
+| `test_portfolio.py` | `_weight_side` caps + normalizes + inverse-vol tilt; `build_portfolio` weights, regime-scaled exposure (evidence/regime monkeypatched); unknown sector errors cleanly. |
 
 ---
 

@@ -38,16 +38,23 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .analysis.backtest import backtest as run_backtest
+from .analysis.regime import market_regime
 from .core.config import Settings
 from .core.disclaimer import DISCLAIMER
 from .core.sectors import list_sectors, resolve_sector
 from .core.sectors import sector_constituents as _sector_constituents
 from .orchestration.debate import (
+    decide as engine_decide,
+)
+from .orchestration.debate import (
     decide_from_scores,
+    enrich_decision,
     gather_evidence,
     score_evidence,
 )
 from .orchestration.market import scan_sector
+from .orchestration.portfolio import build_portfolio, build_sector_portfolio
 from .servers._common import json_default, normalize_symbol
 
 mcp = FastMCP(
@@ -84,11 +91,8 @@ def _dumps(obj: Any) -> str:
     ),
 )
 async def decide_tool(symbol: str) -> str:
-    """Return the deterministic quant :class:`TradeDecision` as JSON."""
-    sym = normalize_symbol(symbol)
-    dossier = await gather_evidence(sym)
-    scored = score_evidence(dossier)
-    decision = decide_from_scores(sym, scored, method="quant")
+    """Return the deterministic quant :class:`TradeDecision` (with sizing + regime) as JSON."""
+    decision = await engine_decide(normalize_symbol(symbol))
     return _dumps(decision.to_dict())
 
 
@@ -233,12 +237,75 @@ async def finalize_decision_tool(
     if suggested_sizing:
         verdict["suggested_sizing"] = suggested_sizing
     decision = decide_from_scores(sym, scored, verdict=verdict, method="debate")
+    decision = await enrich_decision(decision, dossier)
     return _dumps(decision.to_dict())
 
 
 # ---------------------------------------------------------------------------
-# Sector / broad-market tools
+# Sector / broad-market / risk tools
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="market_regime",
+    title="Market regime (risk-on/off)",
+    description=(
+        "Trend + volatility regime on a benchmark (default SPY): risk-on / caution / "
+        "risk-off and a 0..1 gross-exposure scalar that scales how much risk to take. "
+        "Based on price vs 200-day SMA, 12-1 time-series momentum, and a volatility "
+        "overlay. AI-free, no API key."
+    ),
+)
+async def market_regime_tool(benchmark: str = "SPY") -> str:
+    """Return the market regime + gross-exposure scalar as JSON."""
+    return _dumps(await market_regime(benchmark=benchmark))
+
+
+@mcp.tool(
+    name="backtest",
+    title="Backtest the price signals (walk-forward)",
+    description=(
+        "Walk-forward backtest of the trend+momentum long/flat rule on free daily "
+        "history, net of transaction costs: CAGR, Sharpe, max-drawdown, hit-rate, and "
+        "exposure vs buy-and-hold, PLUS the Probabilistic & Deflated Sharpe Ratio so a "
+        "good Sharpe is discounted for sample length and the number of variants tried. "
+        "Only price/factor signals are backtested (others lack free history)."
+    ),
+)
+async def backtest_tool(symbol: str, period: str = "10y", cost_bps: float = 10.0) -> str:
+    """Return the walk-forward backtest + overfit metrics for ``symbol`` as JSON."""
+    return _dumps(await run_backtest(symbol, period=period, cost_bps=cost_bps))
+
+
+@mcp.tool(
+    name="build_portfolio",
+    title="Build a portfolio from symbols",
+    description=(
+        "Build a regime-scaled, conviction x inverse-volatility portfolio from a list "
+        "of symbols: runs the decision engine on each, keeps BUY/SHORT names, weights "
+        "and caps them, and scales gross exposure by the market regime. Returns longs/"
+        "shorts with weights + net/gross exposure. AI-free."
+    ),
+)
+async def build_portfolio_tool(symbols: list[str], max_positions: int = 10, max_weight: float = 0.25) -> str:
+    """Return a constructed portfolio for ``symbols`` as JSON."""
+    result = await build_portfolio(list(symbols), max_positions=max_positions, max_weight=max_weight)
+    return _dumps(result)
+
+
+@mcp.tool(
+    name="build_sector_portfolio",
+    title="Build a portfolio from a sector",
+    description="Build a regime-scaled conviction x inverse-vol portfolio from a sector's constituents.",
+)
+async def build_sector_portfolio_tool(
+    sector: str, limit: int = 12, max_positions: int = 10, max_weight: float = 0.25
+) -> str:
+    """Return a constructed portfolio for a sector as JSON."""
+    result = await build_sector_portfolio(
+        sector, limit=limit or None, max_positions=max_positions, max_weight=max_weight
+    )
+    return _dumps(result)
 
 
 @mcp.tool(

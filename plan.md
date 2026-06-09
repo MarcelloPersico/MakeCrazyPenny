@@ -476,3 +476,65 @@ means the sector layer inherited the deterministic, offline-testable property fo
 - **CLI:** `makecrazypenny --sector tech [--limit N] [--top N]` prints the stance, breadth, and
   ranked ideas (AI-free, no key).
 - Same not-investment-advice disclaimer on every `SectorScan`.
+
+---
+
+## 10. Edge features — research-backed alpha, risk, regime & backtesting
+
+A deep-research pass (multi-source, adversarially verified; free-data constraint) produced a
+ranked, replicated shortlist — the full cited findings, supporting quotes, and per-claim
+adversarial verdicts are in [`RESEARCH.md`](./RESEARCH.md). The sober baseline: Hou-Xue-Zhang's
+*Replicating Anomalies* found **64% of anomalies are insignificant** (85% at t>3) — so we built
+the survivors, not the zoo.
+
+### 10.1 What the evidence supports (and we implemented)
+
+| Feature | Evidence (representative) | Free? |
+|---|---|---|
+| **Momentum 12-1** & **52-week-high proximity** | Jegadeesh-Titman (1993); George-Hwang (2004, ~1.4%/mo) | ✅ OHLCV |
+| **Trend / regime** (price vs 200-DMA; time-series momentum) | Faber (2007); Moskowitz-Ooi-Pedersen (2012) | ✅ OHLCV |
+| **Quality** (gross profitability, ROE, margins) + **Value** (E/P, B/P, FCF yield) | Novy-Marx (2013); Piotroski (2000) | ✅ free fundamentals |
+| **Low volatility** | Frazzini-Pedersen (BAB) — used mainly for *sizing* | ✅ OHLCV |
+| **Volatility targeting** + **fractional (½) Kelly** | Moreira-Muir (2017); Kelly/Thorp, fractional for estimation error | ✅ |
+| **Honest backtesting**: walk-forward, costs, **Deflated/Probabilistic Sharpe** | Bailey & López de Prado | ✅ |
+
+### 10.2 How it was built (all deterministic, free, offline-testable)
+
+- **Factor signals** (`analysis/factors.py`) — momentum/52w-high/trend/realized-vol from OHLCV,
+  plus value/quality from free fundamentals (defensive: a factor that can't be computed is
+  omitted). Folded into the engine's weighted scoring as new categories (momentum, trend, value,
+  quality), so corroboration breadth and conviction improve when factors agree.
+- **Risk & sizing** (`analysis/risk.py`) — ATR stop/target, volatility-target weight, and
+  fractional (½) Kelly from conviction; the position is the *conservative* min of vol-target and
+  Kelly, capped and **scaled by the market regime**. Attached to every `TradeDecision` as
+  `sizing` (stop, target, position %, R-multiple).
+- **Market regime** (`analysis/regime.py`) — SPY trend (200-DMA) + 12-1 time-series momentum +
+  a volatility overlay → `risk_on / caution / risk_off` and a 0..1 **gross-exposure scalar**
+  that dials total risk. Attached to decisions as `regime`; scales sizing and portfolios.
+- **Portfolio construction** (`orchestration/portfolio.py`) — conviction × inverse-volatility
+  weights with proper iterative per-name caps (auto-relaxed to ≥ equal-weight when names are
+  few), gross scaled by the regime; build from a symbol list or a whole sector.
+- **Backtesting** (`analysis/backtest.py`) — walk-forward long/flat trend+momentum strategy net
+  of transaction costs: CAGR / Sharpe / max-DD / hit-rate / exposure vs buy-and-hold, **plus the
+  Probabilistic and Deflated Sharpe Ratio** so a good Sharpe is discounted for sample length,
+  non-normality, and the number of variants tried. Honest scope: only price/factor signals are
+  backtested (analyst/congress/sentiment lack free point-in-time history → excluded to avoid
+  look-ahead).
+
+### 10.3 Surfaces
+
+- **MCP tools:** `market_regime`, `backtest`, `build_portfolio`, `build_sector_portfolio`
+  (and the `decide`/`scan_sector` outputs now carry factor scores + sizing + regime).
+- **CLI:** `makecrazypenny --regime`, `makecrazypenny --backtest SYMBOL`; the `decide` output
+  now shows the sized trade (stop/target/position %) and the market regime.
+
+### 10.4 Honesty about limits
+
+These tilt the odds; they do not guarantee returns. Absolute value/quality thresholds are a
+simplification (these factors are strongest cross-sectionally); curated constituents are
+representative; and the backtest only covers price-history signals. The adversarial review also
+flagged two honesty points we encode: **alpha decays** after publication (McLean-Pontiff: ~58%
+lower post-publication), and **volatility targeting is used for drawdown/tail control, not as a
+guaranteed Sharpe booster** (its Sharpe benefit is contested — Cederburg et al. vs Moreira-Muir).
+Every output keeps the not-investment-advice disclaimer. Use the deflated Sharpe as the bar:
+PSR/DSR **> 0.95** before believing a backtested edge. Full evidence: [`RESEARCH.md`](./RESEARCH.md).

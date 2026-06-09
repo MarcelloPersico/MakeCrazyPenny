@@ -25,6 +25,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from ..analysis.factors import compute_factors
+from ..analysis.regime import market_regime
+from ..analysis.risk import position_sizing
 from ..core.config import Settings
 from ..core.disclaimer import DISCLAIMER
 from ..core.types import DebateTranscript, TradeDecision
@@ -59,6 +62,14 @@ _UPSIDE_SATURATION = 0.20  # ±20% upside -> full weight
 _CONGRESS_WEIGHT = 1.0
 _INSIDER_WEIGHT = 1.0
 _FLOW_SATURATION = 3  # net of 3+ trades -> full weight
+
+#: Factor weights (research-backed; see plan.md §10). Folded into the same
+#: weighted-factor scoring as the other evidence.
+_FACTOR_MOMENTUM_WEIGHT = 2.0
+_FACTOR_TREND_WEIGHT = 1.5
+_FACTOR_52WHIGH_WEIGHT = 1.0
+_FACTOR_VALUE_WEIGHT = 1.5
+_FACTOR_QUALITY_WEIGHT = 1.0
 
 #: Decision thresholds on the net quant score.
 _LONG_THRESHOLD = 1.0
@@ -148,6 +159,7 @@ async def gather_evidence(symbol: str, *, settings: Settings | None = None) -> d
         "price_targets": rep.price_targets(sym),
         "upgrades": rep.upgrades_downgrades(sym),
         "cross_check": syn.cross_check(sym),
+        "factors": compute_factors(sym, settings=settings),
     }
     keys = list(tasks)
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -319,6 +331,68 @@ def _divergence_penalty(dossier: dict[str, Any]) -> float:
     return _clamp(abs(score), 0.0, 1.0)
 
 
+def _score_factors(dossier: dict[str, Any], factors: list[dict[str, Any]]) -> None:
+    """Score the quant factor block (momentum/trend/value/quality) into factors.
+
+    Reads ``dossier["factors"]`` (from :func:`analysis.factors.compute_factors`).
+    Absolute thresholds are used for value/quality (a simplification — these are
+    most powerful cross-sectionally; see plan.md §10). Realized vol is *not* scored
+    directionally here — it feeds position sizing instead.
+    """
+    block = dossier.get("factors")
+    if not isinstance(block, dict):
+        return
+
+    mom = _as_float(block.get("momentum_12_1"))
+    if mom is not None:
+        c = _clamp(mom / 0.30, -1.0, 1.0) * _FACTOR_MOMENTUM_WEIGHT
+        if abs(c) > 1e-9:
+            factors.append(_factor("momentum", "momentum_12_1", c, f"12-1 momentum {mom:+.1%}"))
+
+    trend = _as_float(block.get("trend_200"))
+    if trend is not None:
+        c = _clamp(trend / 0.10, -1.0, 1.0) * _FACTOR_TREND_WEIGHT
+        if abs(c) > 1e-9:
+            where = "above" if trend > 0 else "below"
+            factors.append(_factor("trend", "trend_200", c, f"{where} 200DMA ({trend:+.1%})"))
+
+    p52 = _as_float(block.get("pct_52w_high"))
+    if p52 is not None:
+        c = _clamp((p52 - 0.85) / 0.15, -1.0, 1.0) * _FACTOR_52WHIGH_WEIGHT
+        if abs(c) > 1e-9:
+            factors.append(_factor("momentum", "pct_52w_high", c, f"{p52:.0%} of 52w high"))
+
+    value_subs: list[float] = []
+    ey = _as_float(block.get("earnings_yield"))
+    if ey is not None:
+        value_subs.append(_clamp((ey - 0.045) / 0.045, -1.0, 1.0))
+    fcfy = _as_float(block.get("fcf_yield"))
+    if fcfy is not None:
+        value_subs.append(_clamp(fcfy / 0.06, -1.0, 1.0))
+    bp = _as_float(block.get("book_to_price"))
+    if bp is not None:
+        value_subs.append(_clamp((bp - 0.35) / 0.35, -1.0, 1.0))
+    if value_subs:
+        c = (sum(value_subs) / len(value_subs)) * _FACTOR_VALUE_WEIGHT
+        if abs(c) > 1e-9:
+            factors.append(_factor("value", "value", c, f"value composite ({len(value_subs)} inputs)"))
+
+    q_subs: list[float] = []
+    gp = _as_float(block.get("gross_profitability"))
+    if gp is not None:
+        q_subs.append(_clamp((gp - 0.30) / 0.30, -1.0, 1.0))
+    roe = _as_float(block.get("roe"))
+    if roe is not None:
+        q_subs.append(_clamp((roe - 0.10) / 0.15, -1.0, 1.0))
+    pm = _as_float(block.get("profit_margin"))
+    if pm is not None:
+        q_subs.append(_clamp((pm - 0.05) / 0.10, -1.0, 1.0))
+    if q_subs:
+        c = (sum(q_subs) / len(q_subs)) * _FACTOR_QUALITY_WEIGHT
+        if abs(c) > 1e-9:
+            factors.append(_factor("quality", "quality", c, f"quality composite ({len(q_subs)} inputs)"))
+
+
 def score_evidence(dossier: dict[str, Any]) -> dict[str, Any]:
     """Turn an evidence dossier into a deterministic directional score.
 
@@ -341,6 +415,7 @@ def score_evidence(dossier: dict[str, Any]) -> dict[str, Any]:
     _score_price_target(dossier, factors)
     _score_flow(dossier, "congress", "trades", "congress", _CONGRESS_WEIGHT, factors)
     _score_flow(dossier, "insider", "transactions", "insider", _INSIDER_WEIGHT, factors)
+    _score_factors(dossier, factors)
 
     net = sum(f["contribution"] for f in factors)
     bull = sum(f["contribution"] for f in factors if f["contribution"] > 0)
@@ -561,14 +636,43 @@ def _summary_line(symbol: str, action: str, conviction: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def decide(symbol: str, *, settings: Settings | None = None) -> TradeDecision:
-    """Make the deterministic quant decision for ``symbol``.
+async def enrich_decision(
+    decision: TradeDecision, dossier: dict[str, Any], *, settings: Settings | None = None
+) -> TradeDecision:
+    """Attach the market regime + position sizing to a decision (mutates + returns).
 
-    Gathers evidence across every capability server, scores it, and synthesizes a
-    :class:`TradeDecision`. This is **AI-free** — the bull/bear debate that can
-    override/enrich it is run by an MCP host via :mod:`makecrazypenny.mcp_server`
-    (the host's model, the user's subscription). The result is always a real
-    decision carrying the not-investment-advice disclaimer.
+    Pulls the market-regime read (benchmark trend/vol → gross-exposure scalar) and
+    computes ATR stops/target + a vol-target/½-Kelly position size from the factor
+    block (last close, ATR, realized vol) and the decision's direction/conviction.
+    Never raises — on a regime-fetch failure it sizes without the regime scalar.
+    """
+    fac = dossier.get("factors") if isinstance(dossier.get("factors"), dict) else {}
+    try:
+        regime = await market_regime(settings=settings)
+    except Exception as exc:  # never break the decision over a regime fetch
+        regime = {"regime": "unknown", "_error": f"{type(exc).__name__}: {exc}"}
+    decision.regime = regime if isinstance(regime, dict) else {}
+    gross = regime.get("gross_exposure", 1.0) if isinstance(regime, dict) else 1.0
+    decision.sizing = position_sizing(
+        price=fac.get("last_close"),
+        atr_value=fac.get("atr14"),
+        annual_vol=fac.get("realized_vol"),
+        conviction=decision.conviction,
+        direction=decision.direction,
+        regime_scale=float(gross) if gross is not None else 1.0,
+    )
+    return decision
+
+
+async def decide(symbol: str, *, settings: Settings | None = None) -> TradeDecision:
+    """Make the deterministic quant decision for ``symbol`` (with sizing + regime).
+
+    Gathers evidence across every capability server (incl. the quant factor block),
+    scores it, synthesizes a :class:`TradeDecision`, then enriches it with the market
+    regime and a sized trade (stop/target + vol-target/½-Kelly position). This is
+    **AI-free** — the bull/bear debate that can override it is run by an MCP host via
+    :mod:`makecrazypenny.mcp_server`. Always returns a real decision carrying the
+    not-investment-advice disclaimer.
 
     Args:
         symbol: Ticker (normalized internally).
@@ -581,12 +685,14 @@ async def decide(symbol: str, *, settings: Settings | None = None) -> TradeDecis
     sym = normalize_symbol(symbol)
     dossier = await gather_evidence(sym, settings=settings)
     scored = score_evidence(dossier)
-    return decide_from_scores(sym, scored, method="quant")
+    decision = decide_from_scores(sym, scored, method="quant")
+    return await enrich_decision(decision, dossier, settings=settings)
 
 
 __all__ = [
     "gather_evidence",
     "score_evidence",
     "decide_from_scores",
+    "enrich_decision",
     "decide",
 ]

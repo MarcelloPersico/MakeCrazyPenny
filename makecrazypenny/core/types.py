@@ -474,6 +474,8 @@ class TradeDecision:
     factors: list[dict[str, Any]] = field(default_factory=list)
     method: str = "quant-only"
     data_quality: dict[str, Any] = field(default_factory=dict)
+    sizing: dict[str, Any] = field(default_factory=dict)
+    regime: dict[str, Any] = field(default_factory=dict)
     transcript: DebateTranscript | None = None
     note: str | None = None
     disclaimer: str = ""
@@ -499,6 +501,8 @@ class TradeDecision:
             "factors": [dict(f) for f in self.factors],
             "method": self.method,
             "data_quality": dict(self.data_quality),
+            "sizing": dict(self.sizing),
+            "regime": dict(self.regime),
             "transcript": self.transcript.to_dict() if self.transcript else None,
             "note": self.note,
             "disclaimer": self.disclaimer,

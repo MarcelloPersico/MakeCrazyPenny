@@ -59,6 +59,7 @@ include = [
     "/README.md",
     "/CONTRACT.md",
     "/plan.md",
+    "/RESEARCH.md",
     "/.env.example",
 ]
 

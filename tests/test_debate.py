@@ -192,10 +192,11 @@ async def test_gather_evidence_assembles_dossier(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(reports, "price_targets", lambda s: ok({"targets": {}}))
     monkeypatch.setattr(reports, "upgrades_downgrades", lambda s: ok({"events": []}))
     monkeypatch.setattr(synthesis, "cross_check", lambda s: ok({"divergence": {}}))
+    monkeypatch.setattr(debate, "compute_factors", lambda s, **k: ok({"momentum_12_1": 0.1}))
 
     dossier = await debate.gather_evidence("$aapl")
     assert dossier["symbol"] == "AAPL"
-    for key in ("signals", "mtf", "sentiment", "congress", "insider", "ratings", "price_targets", "upgrades", "cross_check"):
+    for key in ("signals", "mtf", "sentiment", "congress", "insider", "ratings", "price_targets", "upgrades", "cross_check", "factors"):
         assert key in dossier
 
 
@@ -205,7 +206,11 @@ async def test_gather_evidence_marks_failures(monkeypatch: pytest.MonkeyPatch) -
     async def boom(_s: str):
         raise RuntimeError("provider down")
 
+    async def empty(_s: str, **_k: Any):
+        return {}
+
     monkeypatch.setattr(technical, "detect_signals", boom)
+    monkeypatch.setattr(debate, "compute_factors", empty)
     dossier = await debate.gather_evidence("AAPL")
     assert "_error" in dossier["signals"]
     assert "RuntimeError" in dossier["signals"]["_error"]
@@ -218,14 +223,22 @@ async def test_gather_evidence_marks_failures(monkeypatch: pytest.MonkeyPatch) -
 
 async def test_decide_is_quant_and_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_gather(symbol: str, *, settings: Any = None):
-        return BULLISH_DOSSIER
+        return {**BULLISH_DOSSIER, "factors": {"last_close": 100.0, "atr14": 2.0, "realized_vol": 0.25}}
+
+    async def fake_regime(*, benchmark: str = "SPY", settings: Any = None):
+        return {"regime": "risk_on", "gross_exposure": 1.0, "above_200dma": True}
 
     monkeypatch.setattr(debate, "gather_evidence", fake_gather)
+    monkeypatch.setattr(debate, "market_regime", fake_regime)
     dec = await debate.decide("AAPL")
     assert dec.method == "quant"
     assert dec.action == "BUY"
     assert dec.transcript is None
     assert dec.disclaimer
+    # enriched with regime + a sized long
+    assert dec.regime.get("regime") == "risk_on"
+    assert dec.sizing.get("position_pct", 0) > 0
+    assert dec.sizing.get("stop_price") is not None
 
 
 # ---------------------------------------------------------------------------

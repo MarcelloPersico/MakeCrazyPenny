@@ -23,6 +23,8 @@ import asyncio
 import sys
 from typing import Any
 
+from ..analysis.backtest import backtest as run_backtest
+from ..analysis.regime import market_regime as run_regime
 from ..core.disclaimer import with_disclaimer
 from ..servers._sdk import SDK_AVAILABLE, ClaudeSDKClient
 from .agents import build_options
@@ -221,6 +223,19 @@ def _format_decision(d: dict[str, Any]) -> str:
             conv_s = f" [{float(conv):.0%}]" if isinstance(conv, (int, float)) else ""
             lines.append(f"  {a.get('side', '?').upper()} r{a.get('round', '?')}{conv_s}: {a.get('thesis', '')}")
 
+    sizing = d.get("sizing") or {}
+    if sizing.get("position_pct") is not None and sizing.get("direction") in ("LONG", "SHORT"):
+        line = f"Sizing: ~{float(sizing.get('position_pct', 0)):.1%} of risk budget"
+        if sizing.get("stop_price"):
+            line += f"  ·  stop {sizing['stop_price']}  target {sizing['target_price']}  ({sizing.get('r_multiple')}R)"
+        lines += ["", line]
+    regime = d.get("regime") or {}
+    if regime.get("regime"):
+        lines.append(
+            f"Market regime: {regime.get('regime')} (gross x{regime.get('gross_exposure', '?')}"
+            + (f", {regime.get('benchmark')} {'above' if regime.get('above_200dma') else 'below'} 200DMA)" if regime.get('above_200dma') is not None else ")")
+        )
+
     lines += ["", f"Method: {d.get('method', '?')}"]
     if d.get("note"):
         lines.append(f"Note: {d['note']}")
@@ -284,6 +299,43 @@ def _format_scan(s: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_regime(r: dict[str, Any]) -> str:
+    """Render the market-regime dict as an ASCII line block."""
+    lines = [
+        f"MARKET REGIME ({r.get('benchmark', '?')}): {str(r.get('regime', '?')).upper()}",
+        f"Gross exposure scalar: x{r.get('gross_exposure', '?')}",
+    ]
+    if r.get("above_200dma") is not None:
+        lines.append(f"  Above 200DMA: {r.get('above_200dma')}   12-1 momentum: {r.get('ts_momentum')}")
+    if r.get("realized_vol") is not None:
+        lines.append(f"  Realized vol: {float(r['realized_vol']):.0%}   vol scale: x{r.get('vol_scale')}")
+    if r.get("_error"):
+        lines.append(f"  (data issue: {r['_error']})")
+    return "\n".join(lines)
+
+
+def _format_backtest(b: dict[str, Any]) -> str:
+    """Render the backtest result dict as an ASCII report."""
+    if b.get("_error"):
+        return f"Backtest unavailable for {b.get('symbol', '?')}: {b['_error']}"
+    s = b.get("strategy", {})
+    bh = b.get("buy_hold", {})
+    oc = b.get("overfit_checks", {})
+    return "\n".join([
+        f"BACKTEST {b.get('symbol', '?')} ({b.get('period', '?')}) - {b.get('signal', '')}",
+        f"  Days: {b.get('n_days', 0)}   Exposure: {float(b.get('exposure', 0)):.0%}   "
+        f"Trades: {b.get('n_trades', 0)}   Costs: {b.get('cost_bps', 0)}bps",
+        "",
+        f"  Strategy : CAGR {float(s.get('cagr', 0)):+.1%}  Sharpe {s.get('sharpe')}  "
+        f"maxDD {float(s.get('max_drawdown', 0)):.1%}  hit {float(s.get('hit_rate', 0)):.0%}",
+        f"  Buy&hold : ret  {float(bh.get('total_return', 0)):+.1%}  Sharpe {bh.get('sharpe')}  "
+        f"maxDD {float(bh.get('max_drawdown', 0)):.1%}",
+        "",
+        f"  Overfit checks: PSR(vs 0) {oc.get('psr_vs_0')}   Deflated Sharpe {oc.get('deflated_sharpe')}",
+        f"  {oc.get('note', '')}",
+    ])
+
+
 def _normalize_symbol(symbol: str) -> str:
     """Uppercase, strip whitespace, and strip a leading ``$`` from a symbol."""
     cleaned = symbol.strip()
@@ -329,6 +381,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Sector mode: how many long/short ideas to surface (default: 5).",
     )
     parser.add_argument(
+        "--regime",
+        action="store_true",
+        help="Print the market regime (risk-on/off + gross-exposure scalar) and exit.",
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Walk-forward backtest of the price signals for SYMBOL (CAGR/Sharpe/maxDD + deflated Sharpe).",
+    )
+    parser.add_argument(
         "--mode",
         choices=("decide", "report"),
         default="decide",
@@ -357,6 +419,32 @@ def cli(argv: list[str] | None = None) -> int:
         ``0`` on success; ``2`` if the SDK is missing; ``3`` on a runtime error.
     """
     args = _parse_args(argv)
+
+    # --- Market regime (no symbol needed) ------------------------------------
+    if args.regime:
+        try:
+            regime = asyncio.run(run_regime())
+            output = _format_regime(regime)
+        except Exception as exc:
+            print(f"Error: the regime check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    # --- Backtest mode (needs a symbol) --------------------------------------
+    if args.backtest:
+        sym = _normalize_symbol(args.symbol or "")
+        if not sym:
+            print("Error: --backtest needs a ticker SYMBOL.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        try:
+            result = asyncio.run(run_backtest(sym))
+            output = _format_backtest(result)
+        except Exception as exc:
+            print(f"Error: the backtest failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
 
     # --- Sector mode: scan a whole sector (deterministic, AI-free, no key) ----
     if args.sector:
