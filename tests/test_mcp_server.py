@@ -40,7 +40,8 @@ async def test_tools_and_prompts_registered() -> None:
     tools = {t.name for t in await srv.mcp.list_tools()}
     prompts = {p.name for p in await srv.mcp.list_prompts()}
     assert {"decide", "gather_evidence", "finalize_decision", "technical_analysis"} <= tools
-    assert {"decide", "bull_case", "bear_case", "judge"} == prompts
+    assert {"list_sectors", "sector_constituents", "scan_sector"} <= tools
+    assert {"decide", "bull_case", "bear_case", "judge", "decide_sector"} == prompts
 
 
 def test_prompt_builders_normalize_symbol_and_mention_flow() -> None:
@@ -147,3 +148,47 @@ async def test_tool_tolerates_one_failure(monkeypatch: pytest.MonkeyPatch) -> No
     out = json.loads(await srv.analyst_reports_tool("AAPL"))
     assert out["ratings"]["_error"].startswith("RuntimeError")
     assert "price_targets" in out
+
+
+# ---------------------------------------------------------------------------
+# Sector tools + prompt
+# ---------------------------------------------------------------------------
+
+
+def test_list_sectors_tool() -> None:
+    out = json.loads(srv.list_sectors_tool())
+    assert out["count"] == 11
+    assert out["sectors"]["Technology"] > 0
+
+
+def test_sector_constituents_tool_resolves_alias() -> None:
+    out = json.loads(srv.sector_constituents_tool("tech"))
+    assert out["sector"] == "Technology"
+    assert "AAPL" in out["constituents"]
+    # Unknown sector lists the available ones.
+    miss = json.loads(srv.sector_constituents_tool("zzz"))
+    assert miss["sector"] is None
+    assert miss["available"]
+
+
+async def test_scan_sector_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    from makecrazypenny.orchestration import market
+
+    async def fake_gather(symbol: str, *, settings: Any = None):
+        return {**BULLISH_DOSSIER, "symbol": symbol}
+
+    monkeypatch.setattr(market, "gather_evidence", fake_gather)
+    out = json.loads(await srv.scan_sector_tool("tech", limit=4, top_n=3))
+    assert out["sector"] == "Technology"
+    assert out["n_analyzed"] == 4
+    assert out["stance"] == "overweight"
+    assert out["disclaimer"]
+
+
+def test_decide_sector_prompt_builder() -> None:
+    text = srv.build_decide_sector_prompt("healthcare", 3)
+    assert "Health Care" in text
+    assert "scan_sector" in text
+    assert "NOT investment advice" in text
+    # Bad top_n must not raise.
+    assert "Technology" in srv.decide_sector_prompt("tech", top_n="oops")

@@ -423,3 +423,56 @@ The decision is informational and educational. Every `TradeDecision` carries the
 `core/disclaimer.py` text and a transparent `factors` breakdown; every prompt ends with the
 reminder; the system never places an order and explicitly surfaces conviction, data gaps, and an
 invalidation condition.
+
+---
+
+## 9. Broad-market analysis — by sector
+
+The decision engine answered "what about *this* ticker?" This layer widens the lens to "what
+about *this part of the market?*", starting with **sector** scans (the first cut of broader
+market coverage; industry / index / watchlist scans can follow behind the same interface).
+
+### 9.1 How it works
+
+```
+   resolve_sector("tech") -> "Technology" -> [AAPL, MSFT, NVDA, ...]   (curated, offline)
+        │
+        ▼  (per constituent, concurrent, bounded by a semaphore)
+   gather_evidence -> score_evidence -> decide_from_scores   (the §8 engine, reused as-is)
+        │
+        ▼  aggregate_scan(...)
+   SectorScan:  stance (overweight / underweight / neutral)
+                net_tilt (mean momentum) · breadth (% bullish) · avg conviction
+                rankings (most→least bullish) · top long ideas · top short ideas
+```
+
+It **reuses the single-ticker engine unchanged** — a sector decision is just N ticker decisions
+plus an aggregation. That keeps one source of truth for "what makes a name bullish/bearish" and
+means the sector layer inherited the deterministic, offline-testable property for free.
+
+### 9.2 Design choices
+
+- **Curated constituents, not fetched.** `core/sectors.py` maps the eleven GICS sectors to
+  representative liquid large-caps. Deterministic, free, offline — you can resolve and scan a
+  sector with no API key. The resolver is tolerant (aliases, case, unique-substring: `tech`,
+  `healthcare`, `reits` all work). A later revision can swap in live ETF-holdings behind the same
+  `sector_constituents()` interface without touching the engine.
+- **Bounded concurrency.** A sector is ~8–12 names, each fanning out to ~9 capability calls, so
+  `scan_sector` runs constituents through an `asyncio.Semaphore` (5 at a time). Combined with the
+  Layer-0 cache + rate governor + circuit breaker, a wide scan degrades gracefully instead of
+  stampeding the free-tier providers.
+- **Independent names.** One bad ticker becomes an `errors` entry; the sweep continues. An
+  unknown sector returns an empty scan that explains itself rather than raising.
+- **Stance, not just a list.** The aggregation produces an actionable sector read — overweight /
+  underweight / neutral from breadth + net momentum — plus ranked long and short ideas, which is
+  the "broad market" answer the lens was widened for.
+
+### 9.3 Surfaces
+
+- **MCP tools:** `list_sectors`, `sector_constituents`, `scan_sector` (deterministic) — and the
+  **`decide_sector` prompt**, which has the host scan the sector, debate the top long/short
+  candidates (reusing the bull/bear/judge flow per name), and synthesize a sector playbook on the
+  user's own subscription.
+- **CLI:** `makecrazypenny --sector tech [--limit N] [--top N]` prints the stance, breadth, and
+  ranked ideas (AI-free, no key).
+- Same not-investment-advice disclaimer on every `SectorScan`.

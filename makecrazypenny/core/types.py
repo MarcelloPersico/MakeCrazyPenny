@@ -505,6 +505,69 @@ class TradeDecision:
         }
 
 
+@dataclass
+class SectorScan:
+    """A sector-wide aggregation of per-ticker decisions (see CONTRACT.md §10.5).
+
+    Produced by :func:`makecrazypenny.orchestration.market.scan_sector`: the
+    deterministic decision engine is run on each constituent and the results are
+    aggregated into a sector read — a ``stance``, breadth statistics, and ranked
+    long/short ideas.
+
+    Attributes:
+        sector: The canonical sector name analysed.
+        stance: ``"overweight"`` / ``"underweight"`` / ``"neutral"`` — the
+            sector-level tilt from breadth + net momentum.
+        n_requested: How many constituents were requested (after any ``limit``).
+        n_analyzed: How many produced a decision (the rest are in ``errors``).
+        net_tilt: Mean quant ``net_score`` across analysed names (sector momentum).
+        avg_conviction: Mean conviction across analysed names.
+        breadth: Counts + percentages: ``buy``/``short``/``avoid`` and
+            ``bullish_pct``/``bearish_pct``.
+        rankings: All analysed names as compact dicts, sorted most→least bullish.
+        top_longs: The strongest BUY ideas (compact dicts).
+        top_shorts: The strongest SHORT ideas (compact dicts).
+        errors: ``{"symbol", "error"}`` for any constituent that failed.
+        method: Decision method tag (``"quant"``).
+        summary: One-line human-readable sector verdict.
+        disclaimer: The not-investment-advice disclaimer (always present).
+    """
+
+    sector: str
+    stance: str = "neutral"
+    n_requested: int = 0
+    n_analyzed: int = 0
+    net_tilt: float = 0.0
+    avg_conviction: float = 0.0
+    breadth: dict[str, Any] = field(default_factory=dict)
+    rankings: list[dict[str, Any]] = field(default_factory=list)
+    top_longs: list[dict[str, Any]] = field(default_factory=list)
+    top_shorts: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    method: str = "quant"
+    summary: str = ""
+    disclaimer: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "sector": self.sector,
+            "stance": self.stance,
+            "n_requested": self.n_requested,
+            "n_analyzed": self.n_analyzed,
+            "net_tilt": self.net_tilt,
+            "avg_conviction": self.avg_conviction,
+            "breadth": dict(self.breadth),
+            "rankings": [dict(r) for r in self.rankings],
+            "top_longs": [dict(r) for r in self.top_longs],
+            "top_shorts": [dict(r) for r in self.top_shorts],
+            "errors": [dict(e) for e in self.errors],
+            "method": self.method,
+            "summary": self.summary,
+            "disclaimer": self.disclaimer,
+        }
+
+
 def to_dict(obj: Any) -> Any:
     """Best-effort conversion of a core value object (or list thereof) to JSON.
 
@@ -539,6 +602,7 @@ __all__ = [
     "DebateArgument",
     "DebateTranscript",
     "TradeDecision",
+    "SectorScan",
     "to_dict",
     "utcnow_iso",
 ]

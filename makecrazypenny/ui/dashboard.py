@@ -296,6 +296,77 @@ def _render_decision(symbol: str, data: dict[str, Any]) -> None:
         st.code(build_decide_prompt(symbol), language="text")
 
 
+def _render_sector() -> None:
+    """Self-contained sector-scan panel: pick a sector, scan it, show the read."""
+    from makecrazypenny.core.sectors import list_sectors
+    from makecrazypenny.orchestration.market import scan_sector
+
+    st.caption(
+        "Scan a whole sector: the deterministic engine ranks every constituent into "
+        "a stance (overweight / underweight / neutral) and long/short ideas. AI-free, "
+        "no API key. For the full debated sector playbook, run the `decide_sector` MCP "
+        "prompt in your host."
+    )
+    c1, c2, c3 = st.columns([2, 1, 1])
+    sector = c1.selectbox("Sector", list_sectors(), index=0)
+    limit = c2.slider("Max names", 4, 15, 12)
+    top_n = c3.slider("Top ideas", 1, 8, 5)
+
+    if not st.button("🧭 Scan sector", type="primary"):
+        return
+
+    with st.spinner(f"Scanning {sector}…"):
+        try:
+            scan = asyncio.run(scan_sector(sector, limit=limit or None, top_n=top_n)).to_dict()
+        except Exception as exc:  # pragma: no cover - UI guardrail
+            st.error(f"Sector scan failed: {explain_failure(exc)}")
+            return
+
+    stance = str(scan.get("stance", "neutral"))
+    badge = {"overweight": "🟢 Overweight", "underweight": "🔴 Underweight", "neutral": "🟡 Neutral"}.get(
+        stance, stance
+    )
+    br = scan.get("breadth", {})
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Stance", badge)
+    m2.metric("Net tilt", fmt_num(scan.get("net_tilt")))
+    m3.metric("Bullish", fmt_pct(br.get("bullish_pct")))
+    m4.metric("Analyzed", f"{scan.get('n_analyzed', 0)}/{scan.get('n_requested', 0)}")
+    if scan.get("summary"):
+        st.markdown(f"**{scan['summary']}**")
+
+    lcol, scol = st.columns(2)
+    with lcol:
+        st.markdown("**🟢 Top long ideas**")
+        longs = scan.get("top_longs") or []
+        if longs:
+            st.dataframe(
+                pd.DataFrame(longs)[["symbol", "action", "net_score", "conviction"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No long ideas.")
+    with scol:
+        st.markdown("**🔴 Top short ideas**")
+        shorts = scan.get("top_shorts") or []
+        if shorts:
+            st.dataframe(
+                pd.DataFrame(shorts)[["symbol", "action", "net_score", "conviction"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No short ideas.")
+
+    with st.expander("Full ranking"):
+        rankings = scan.get("rankings") or []
+        if rankings:
+            st.dataframe(pd.DataFrame(rankings), use_container_width=True, hide_index=True)
+    if scan.get("errors"):
+        st.caption(f"Skipped {len(scan['errors'])} name(s) on error.")
+
+
 def _render_overview(data: dict[str, Any]) -> None:
     cc = data.get("cross_check", {})
     err = has_error(cc)
@@ -575,7 +646,10 @@ def render() -> None:
 
     params = st.session_state.get("params")
     if not params:
-        st.info("Enter a ticker in the sidebar and click **Analyze** to begin.")
+        st.info("Enter a ticker in the sidebar and click **Analyze** to begin — or scan a whole sector below.")
+        st.divider()
+        st.subheader("🧭 Scan a sector")
+        _render_sector()
         return
 
     loader = st.cache_data(ttl=300, show_spinner=False)(run_load)
@@ -583,11 +657,13 @@ def render() -> None:
         data = loader(**params)
 
     st.subheader(f"Results for {params['symbol']}")
-    tab_decision, tab_overview, tab_tech, tab_sent, tab_cong, tab_rep = st.tabs(
-        ["⚖️ Decision", "📊 Overview", "📈 Technical", "📰 Sentiment", "🏛 Congress", "🎯 Reports"]
+    tab_decision, tab_sector, tab_overview, tab_tech, tab_sent, tab_cong, tab_rep = st.tabs(
+        ["⚖️ Decision", "🧭 Sector", "📊 Overview", "📈 Technical", "📰 Sentiment", "🏛 Congress", "🎯 Reports"]
     )
     with tab_decision:
         _safe_panel("Decision", data, lambda d: _render_decision(params["symbol"], d))
+    with tab_sector:
+        _render_sector()
     with tab_overview:
         _render_overview(data)
     with tab_tech:

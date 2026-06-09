@@ -40,11 +40,14 @@ from mcp.server.fastmcp import FastMCP
 
 from .core.config import Settings
 from .core.disclaimer import DISCLAIMER
+from .core.sectors import list_sectors, resolve_sector
+from .core.sectors import sector_constituents as _sector_constituents
 from .orchestration.debate import (
     decide_from_scores,
     gather_evidence,
     score_evidence,
 )
+from .orchestration.market import scan_sector
 from .servers._common import json_default, normalize_symbol
 
 mcp = FastMCP(
@@ -233,6 +236,57 @@ async def finalize_decision_tool(
     return _dumps(decision.to_dict())
 
 
+# ---------------------------------------------------------------------------
+# Sector / broad-market tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="list_sectors",
+    title="List market sectors",
+    description="List the available market sectors (the 11 GICS sectors) and how many constituents each has.",
+)
+def list_sectors_tool() -> str:
+    """Return the available sectors and their constituent counts as JSON."""
+    sectors = {name: len(_sector_constituents(name)) for name in list_sectors()}
+    return _dumps({"sectors": sectors, "count": len(sectors)})
+
+
+@mcp.tool(
+    name="sector_constituents",
+    title="Sector constituents",
+    description="Return the constituent ticker symbols for a sector (accepts aliases like 'tech', 'healthcare').",
+)
+def sector_constituents_tool(sector: str) -> str:
+    """Return the resolved sector name and its constituent symbols as JSON."""
+    canonical = resolve_sector(sector)
+    return _dumps(
+        {
+            "query": sector,
+            "sector": canonical,
+            "constituents": _sector_constituents(sector),
+            "available": list_sectors() if canonical is None else None,
+        }
+    )
+
+
+@mcp.tool(
+    name="scan_sector",
+    title="Scan a whole sector (quant ranking)",
+    description=(
+        "Run the deterministic decision engine across a sector's constituents and "
+        "return an aggregated SectorScan: sector stance (overweight/underweight/"
+        "neutral), breadth, and ranked BUY/SHORT ideas. AI-free, no API key. Use "
+        "this as the quant baseline before debating the sector. `limit` caps how "
+        "many names are scanned; `top_n` sets how many long/short ideas to surface."
+    ),
+)
+async def scan_sector_tool(sector: str, limit: int = 12, top_n: int = 5) -> str:
+    """Return the aggregated :class:`SectorScan` for ``sector`` as JSON."""
+    scan = await scan_sector(sector, limit=limit or None, top_n=top_n)
+    return _dumps(scan.to_dict())
+
+
 async def _safe_gather(*coros: Any) -> list[Any]:
     """Await coroutines concurrently; a failure becomes an ``{"_error": ...}`` dict."""
     import asyncio
@@ -326,6 +380,37 @@ def build_judge_prompt(symbol: str) -> str:
     )
 
 
+def build_decide_sector_prompt(sector: str, top_n: int = 3) -> str:
+    """Build the sector-debate orchestration prompt for the host's model."""
+    canonical = resolve_sector(sector)
+    label = canonical or sector
+    return (
+        f"You are running MakeCrazyPenny's sector analysis for the {label} sector. "
+        "Your goal is a sector playbook: an overall stance plus the best long and "
+        "short ideas within it.\n\n"
+        "Follow these steps:\n"
+        f"1. SCAN — Call the `scan_sector` tool for '{label}' (it analyses every "
+        "constituent with the deterministic quant engine and returns a stance, "
+        "breadth, and ranked BUY/SHORT ideas). Note the sector stance and breadth.\n"
+        f"2. SHORTLIST — Take the top {top_n} long candidates and top {top_n} short "
+        "candidates from the scan.\n"
+        "3. DEBATE — For each shortlisted name, run a quick bull-vs-bear check: call "
+        "`gather_evidence` (or the per-domain tools) for it, argue the strongest "
+        "case for and against, and decide whether the quant ranking holds. Drop "
+        "names whose case is weak on inspection.\n"
+        "4. SYNTHESIZE — Produce the sector playbook: the overall stance "
+        "(overweight / underweight / neutral) with its rationale, the surviving "
+        "long ideas (each with a one-line thesis and conviction), the surviving "
+        "short ideas (same), the key sector-wide risks, and what would change the "
+        "stance.\n"
+        "5. (Optional) For any single name you want the canonical decision object, "
+        "call `finalize_decision` with your verdict.\n\n"
+        "If you have a sub-agent / Task capability, fan the per-name debates out to "
+        "parallel sub-agents. Present the stance first, then longs, then shorts, "
+        "then risks. This is informational only and is NOT investment advice."
+    )
+
+
 @mcp.prompt(
     name="decide",
     title="Decide: bull vs bear debate -> BUY/SHORT/AVOID",
@@ -356,6 +441,20 @@ def bear_prompt(symbol: str) -> str:
 def judge_prompt(symbol: str) -> str:
     """MCP prompt: the orchestrator/judge persona for ``symbol``."""
     return build_judge_prompt(symbol)
+
+
+@mcp.prompt(
+    name="decide_sector",
+    title="Decide a whole sector -> stance + long/short ideas",
+    description="Scan a sector and debate the best long/short ideas using the host's model.",
+)
+def decide_sector_prompt(sector: str, top_n: str = "3") -> str:
+    """MCP prompt: orchestrate a sector scan + per-name debate for ``sector``."""
+    try:
+        n = max(1, int(top_n))
+    except (TypeError, ValueError):
+        n = 3
+    return build_decide_sector_prompt(sector, n)
 
 
 # Keep a reference so linters see the config import is intentional (settings are

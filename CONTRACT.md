@@ -74,6 +74,7 @@ makecrazypenny/core/types.py        dataclasses (see §5)
 makecrazypenny/core/config.py       Settings + CAPABILITY_CHAINS default
 makecrazypenny/core/disclaimer.py   DISCLAIMER: str; with_disclaimer(text)->str
 makecrazypenny/core/errors.py       error taxonomy (see §6)
+makecrazypenny/core/sectors.py      curated GICS sector -> constituents map + resolver (§10.5)
 makecrazypenny/providers/__init__.py  imports every provider module; get_registry()  [DONE]
 makecrazypenny/providers/base.py       Provider ABC + @register_provider + PROVIDER_REGISTRY
 makecrazypenny/providers/ratelimit.py  TokenBucket
@@ -100,7 +101,8 @@ makecrazypenny/mcp_server.py            host-driven FastMCP server: tools + deba
 makecrazypenny/orchestration/__init__.py                                      [DONE]
 makecrazypenny/orchestration/agents.py  AgentDefinitions + build_options() (report mode)
 makecrazypenny/orchestration/debate.py  deterministic decision engine (see §10.3)
-makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report modes)
+makecrazypenny/orchestration/market.py  sector-wide scan engine (see §10.5)
+makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report | --sector)
 tests/                                 mirrors source (see §11)
 ```
 
@@ -161,6 +163,7 @@ The debate-driven decision engine adds three value types (same conventions: plai
 | `DebateArgument` | `side: str` (`"bull"`/`"bear"`), `round: int`, `thesis: str`, `key_points: list[str]`, `cited_evidence: list[str]`, `conviction: float \| None` (0..1), `rebuts: list[str]` |
 | `DebateTranscript` | `symbol: str`, `rounds: int`, `arguments: list[DebateArgument]`; helpers `for_side(side)`, `latest(side)` |
 | `TradeDecision` | `symbol`, `action` (`"BUY"`/`"SHORT"`/`"AVOID"`), `direction` (`"LONG"`/`"SHORT"`/`"FLAT"`), `conviction: float` (0..1), `horizon`, `suggested_sizing`, `summary`, `rationale: list[str]`, `bull_case: list[str]`, `bear_case: list[str]`, `risks: list[str]`, `invalidation: str \| None`, `net_score`, `bull_score`, `bear_score`, `factors: list[dict]`, `method` (`"quant"`/`"debate"`), `data_quality: dict`, `transcript: DebateTranscript \| None`, `note: str \| None`, `disclaimer: str` |
+| `SectorScan` | `sector`, `stance` (`"overweight"`/`"underweight"`/`"neutral"`), `n_requested`, `n_analyzed`, `net_tilt: float`, `avg_conviction: float`, `breadth: dict` (buy/short/avoid + bullish_pct/bearish_pct), `rankings: list[dict]`, `top_longs: list[dict]`, `top_shorts: list[dict]`, `errors: list[dict]`, `method`, `summary`, `disclaimer` |
 
 `TradeDecision` always carries the not-investment-advice `disclaimer` and the quant
 `factors` breakdown for transparency, even when an LLM judge sets the final call.
@@ -584,6 +587,36 @@ via the `makecrazypenny-mcp` console script (or `python -m makecrazypenny.mcp_se
 Import-safe (no network at import); tools fetch lazily. Logs go to stderr so stdout stays a
 clean JSON-RPC stream.
 
+### 10.5 `market.py` + `core/sectors.py` — sector-wide scan
+
+Extends the single-ticker engine to **a broad slice of the market**. `core/sectors.py` is a
+curated, deterministic map of the **eleven GICS sectors** to representative liquid constituents
+(`SECTORS`), with a tolerant `resolve_sector(name)` (aliases, case, unique-substring) and
+`sector_constituents(name)` — pure stdlib, offline, no key (a future revision could back it
+with live ETF-holdings data behind the same interface).
+
+`orchestration/market.py` runs the deterministic decision engine (§10.3) on each constituent
+and aggregates:
+
+- **`scan_sector(sector, *, limit=None, top_n=5, settings=None) -> SectorScan`** — resolves the
+  sector, analyses constituents concurrently under a bounded semaphore
+  (`MAX_CONCURRENCY=5`, so a wide scan stays within rate budgets), and aggregates. Each ticker
+  is independent — one failure becomes an `errors` entry, never aborting the sweep. An unknown
+  sector returns an empty scan whose `errors` explains why (never raises).
+- **`aggregate_scan(sector, decisions, errors, *, n_requested, top_n=5) -> SectorScan`** — pure.
+  Computes `net_tilt` (mean net score = sector momentum), breadth (BUY/SHORT/AVOID +
+  bullish/bearish %), `avg_conviction`, the full `rankings` (most→least bullish), and the top
+  long/short ideas. Derives a sector **`stance`**: *overweight* (net_tilt ≥ 1 and ≥40% bullish),
+  *underweight* (net_tilt ≤ −1 and ≥40% bearish), else *neutral*.
+
+**MCP surface** (in `mcp_server.py`): tools `list_sectors`, `sector_constituents`,
+`scan_sector` (deterministic), and the `decide_sector` prompt — the host scans the sector, then
+debates the top long/short candidates and synthesizes a sector playbook (stance + ranked ideas
++ risks). **CLI:** `makecrazypenny --sector tech [--limit N] [--top N]` prints the scan.
+
+AI-free and offline-testable; the AI debate over a scan is run by the host (the user's
+subscription), like the single-ticker flow.
+
 ---
 
 ## 11. Tests (`tests/`, pytest + pytest-asyncio, `asyncio_mode=auto`, NO network)
@@ -600,7 +633,8 @@ Mirror the source tree. All tests deterministic and offline.
 | `test_servers_*.py` | monkeypatch each server's `get_registry()` to a fake returning canned data; assert tool logic shapes the correct content dict; technical indicators computed on a synthetic OHLCV frame. |
 | `test_imports.py` | importing every module in `makecrazypenny.*` succeeds with no keys and (ideally) without optional libs present. |
 | `test_debate.py` | quant backbone scores bullish/bearish/thin dossiers correctly; `decide_from_scores` maps to BUY/SHORT/AVOID and a host verdict overrides; `gather_evidence` tolerates failures; `decide` is deterministic `method="quant"`; CLI output is ASCII. |
-| `test_mcp_server.py` | FastMCP tools + prompts registered; prompt builders normalize the symbol and embed the bull/bear/judge flow; `decide`/`gather_evidence`/`finalize_decision` tools return correct JSON (verdict overrides quant); per-domain tools tolerate a single failure. All AI-free/offline. |
+| `test_mcp_server.py` | FastMCP tools + prompts registered (incl. sector tools + `decide_sector`); prompt builders normalize the symbol and embed the bull/bear/judge flow; `decide`/`gather_evidence`/`finalize_decision` tools return correct JSON (verdict overrides quant); sector tools resolve + scan; per-domain tools tolerate a single failure. All AI-free/offline. |
+| `test_market.py` | sector resolver (aliases/case/substring/unknown); `aggregate_scan` ranks, classifies breadth, and derives overweight/underweight/neutral stance; `scan_sector` analyses constituents (evidence monkeypatched), respects `limit`, tolerates a failed name, and errors cleanly on an unknown sector. |
 
 ---
 

@@ -28,6 +28,11 @@ Under the debate sits a **pure, deterministic quant backbone**, so the `decide` 
 **cross-checked research report** mode also remains. See [`plan.md`](./plan.md) §8 for
 the design and [`CONTRACT.md`](./CONTRACT.md) §10.3–§10.4 for the build spec.
 
+It also analyses a **whole sector** at once: `scan_sector` runs the engine across a
+sector's constituents and returns a stance (overweight / underweight / neutral),
+breadth, and ranked long/short ideas; the `decide_sector` prompt then debates the top
+candidates into a sector playbook. See [`plan.md`](./plan.md) §9.
+
 > **Why an MCP server instead of the API?** So the AI runs on your existing Claude
 > subscription via the host, not a metered API key. MCP "sampling" would be the ideal
 > mechanism but no Claude host implements it yet, so the debate is exposed as MCP
@@ -157,6 +162,11 @@ model gathers evidence via the tools, argues bull vs bear, judges, and calls
 `bull_case` / `bear_case` / `judge` prompts individually, or call any tool directly
 (e.g. `decide AAPL` for the instant quant baseline).
 
+For a **whole sector**, run the **`decide_sector`** prompt (e.g. `tech`, `healthcare`,
+`energy`): the host calls `scan_sector` for the quant ranking, debates the top
+long/short candidates, and synthesizes a sector playbook. Or call the tools directly —
+`list_sectors`, `sector_constituents`, `scan_sector`.
+
 ## Run the CLI (deterministic quant decision)
 
 The CLI gives the AI-free quant decision instantly — handy for scripting/CI:
@@ -166,12 +176,16 @@ The CLI gives the AI-free quant decision instantly — handy for scripting/CI:
 python -m makecrazypenny.orchestration.main AAPL
 makecrazypenny NVDA              # console script (installed by `pip install -e .`)
 
+# Scan a whole sector: stance + ranked long/short ideas
+makecrazypenny --sector tech --limit 12 --top 5
+makecrazypenny --sector healthcare
+
 # Classic cross-checked research report (needs the Claude Agent SDK)
 python -m makecrazypenny.orchestration.main AAPL --mode report --depth 2
 ```
 
 ```
-usage: makecrazypenny [-h] [--mode {decide,report}] [--depth DEPTH] SYMBOL
+usage: makecrazypenny [-h] [--sector NAME] [--limit N] [--top N] [--mode {decide,report}] [--depth DEPTH] [SYMBOL]
 ```
 
 `decide` mode (default) normalizes the symbol (`$aapl` → `AAPL`) and prints the

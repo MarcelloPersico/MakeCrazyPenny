@@ -27,6 +27,7 @@ from ..core.disclaimer import with_disclaimer
 from ..servers._sdk import SDK_AVAILABLE, ClaudeSDKClient
 from .agents import build_options
 from .debate import decide as run_decision
+from .market import scan_sector as run_sector_scan
 
 # Exit codes.
 EXIT_OK = 0
@@ -233,6 +234,56 @@ def _format_decision(d: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_scan(s: dict[str, Any]) -> str:
+    """Render a :class:`SectorScan` dict as a readable ASCII CLI report."""
+    if s.get("errors") and s.get("n_analyzed", 0) == 0:
+        return f"Sector scan failed: {s['errors'][0].get('error', 'unknown error')}"
+
+    br = s.get("breadth", {})
+    lines: list[str] = [
+        f"SECTOR SCAN: {s.get('sector', '?')}  ->  {str(s.get('stance', '?')).upper()}",
+        s.get("summary", ""),
+        "",
+        (
+            f"Net tilt: {s.get('net_tilt', 0):+.2f}   "
+            f"Avg conviction: {float(s.get('avg_conviction', 0)):.0%}   "
+            f"Analyzed: {s.get('n_analyzed', 0)}/{s.get('n_requested', 0)}"
+        ),
+        (
+            f"Breadth: {br.get('buy', 0)} BUY / {br.get('short', 0)} SHORT / "
+            f"{br.get('avoid', 0)} AVOID  ({float(br.get('bullish_pct', 0)):.0%} bullish)"
+        ),
+    ]
+
+    def _rows(items: list, label: str) -> None:
+        lines.append("")
+        lines.append(label)
+        if not items:
+            lines.append("  (none)")
+            return
+        for e in items:
+            lines.append(
+                f"  {e.get('symbol', '?'):<6} {e.get('action', '?'):<5} "
+                f"net {e.get('net_score', 0):+.2f}  conv {float(e.get('conviction', 0)):.0%}"
+            )
+
+    _rows(s.get("top_longs") or [], "Top long ideas:")
+    _rows(s.get("top_shorts") or [], "Top short ideas:")
+
+    if s.get("errors"):
+        lines.append("")
+        lines.append(f"Skipped {len(s['errors'])} name(s) on error.")
+
+    lines += [
+        "",
+        f"Method: {s.get('method', '?')}",
+        "Tip: for the full bull-vs-bear debate over this sector (on your own "
+        "subscription), mount the MCP server (makecrazypenny-mcp) and run its "
+        "`decide_sector` prompt.",
+    ]
+    return "\n".join(lines)
+
+
 def _normalize_symbol(symbol: str) -> str:
     """Uppercase, strip whitespace, and strip a leading ``$`` from a symbol."""
     cleaned = symbol.strip()
@@ -246,16 +297,36 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="makecrazypenny",
         description=(
-            "Run MakeCrazyPenny over a stock symbol. In 'decide' mode (default) a "
-            "bull and a bear advocate debate and an orchestrator decides BUY / SHORT "
-            "/ AVOID. In 'report' mode it prints a cross-checked research report. "
-            "Informational only; NOT investment advice."
+            "Run MakeCrazyPenny over a single stock or a whole sector. With a SYMBOL "
+            "(decide mode, default) it prints a BUY/SHORT/AVOID quant decision. With "
+            "--sector it scans every constituent and prints a sector stance + ranked "
+            "long/short ideas. Informational only; NOT investment advice."
         ),
     )
     parser.add_argument(
         "symbol",
         metavar="SYMBOL",
-        help="Ticker symbol to analyze (e.g. AAPL or $aapl).",
+        nargs="?",
+        default=None,
+        help="Ticker symbol to analyze (e.g. AAPL or $aapl). Omit when using --sector.",
+    )
+    parser.add_argument(
+        "--sector",
+        metavar="NAME",
+        default=None,
+        help="Scan a whole sector instead of a single symbol (e.g. tech, healthcare, energy).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=12,
+        help="Sector mode: max constituents to scan (default: 12).",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="Sector mode: how many long/short ideas to surface (default: 5).",
     )
     parser.add_argument(
         "--mode",
@@ -286,10 +357,28 @@ def cli(argv: list[str] | None = None) -> int:
         ``0`` on success; ``2`` if the SDK is missing; ``3`` on a runtime error.
     """
     args = _parse_args(argv)
-    symbol = _normalize_symbol(args.symbol)
 
+    # --- Sector mode: scan a whole sector (deterministic, AI-free, no key) ----
+    if args.sector:
+        try:
+            scan = asyncio.run(run_sector_scan(args.sector, limit=args.limit or None, top_n=args.top))
+            output = _format_scan(scan.to_dict())
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        except Exception as exc:  # surface cleanly, no traceback
+            print(f"Error: the sector scan failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    # --- Single-symbol mode --------------------------------------------------
+    symbol = _normalize_symbol(args.symbol or "")
     if not symbol:
-        print("Error: a non-empty ticker symbol is required.", file=sys.stderr)
+        print(
+            "Error: provide a ticker SYMBOL, or use --sector NAME to scan a sector.",
+            file=sys.stderr,
+        )
         return EXIT_RUNTIME_ERROR
 
     # 'decide' mode is the deterministic quant decision — AI-free, no API key. The
