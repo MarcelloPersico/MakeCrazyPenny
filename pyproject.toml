@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "MakeCrazyPenny", email = "persico.mlo@gmail.com" }]
-keywords = ["mcp", "claude", "agent", "finance", "stocks", "analysis"]
+keywords = ["mcp", "claude", "agent", "finance", "stocks", "crypto", "perpetuals", "leverage", "analysis"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

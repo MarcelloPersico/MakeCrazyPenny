@@ -25,23 +25,18 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from ..analysis.indicators import (
+    DEFAULT_INDICATORS,
+    clean_float as _clean_float,
+    compute_indicator_frame as _compute_indicator_frame,
+    ohlcv_to_dataframe as _ohlcv_to_dataframe,
+    signals_from_frame as _signals_from_frame,
+    summarize_timeframe as _summarize_timeframe,
+)
 from ..core.disclaimer import DISCLAIMER
 from ..providers import get_registry as _provider_get_registry
 from ._common import normalize_symbol, text_result
 from ._sdk import create_sdk_mcp_server, tool
-
-# Default indicator set for :func:`compute_indicators` (CONTRACT.md §9.2).
-DEFAULT_INDICATORS: tuple[str, ...] = (
-    "rsi",
-    "macd",
-    "bbands",
-    "sma",
-    "ema",
-    "atr",
-    "stoch",
-    "adx",
-    "obv",
-)
 
 # Timeframes summarized by :func:`multi_timeframe_summary`.
 _MTF_TIMEFRAMES: tuple[tuple[str, str, str], ...] = (
@@ -75,71 +70,6 @@ def get_registry() -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _clean_float(value: Any) -> float | None:
-    """Coerce ``value`` to a JSON-safe float, mapping NaN/inf/None to ``None``."""
-    if value is None:
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    # NaN != NaN; also reject infinities which are not valid JSON.
-    if f != f or f in (float("inf"), float("-inf")):
-        return None
-    return f
-
-
-def _last_clean(series: Any) -> float | None:
-    """Return the last non-NaN value of a pandas Series as a JSON-safe float."""
-    if series is None:
-        return None
-    try:
-        dropped = series.dropna()
-    except AttributeError:
-        return _clean_float(series)
-    if len(dropped) == 0:
-        return None
-    return _clean_float(dropped.iloc[-1])
-
-
-def _ohlcv_to_dataframe(data: dict[str, Any]) -> Any:
-    """Build a ``pandas.DataFrame`` from an ``OHLCV.to_dict()`` payload.
-
-    Lazy-imports ``pandas``. The frame is indexed by timestamp (parsed when
-    possible) and has lowercase ``open/high/low/close/volume`` columns sorted in
-    ascending time order.
-
-    Args:
-        data: The ``data`` field of a ``registry.fetch("ohlcv", ...)`` envelope
-            (an ``OHLCV.to_dict()`` dict with a ``bars`` list).
-
-    Returns:
-        A ``pandas.DataFrame``. Empty (no rows) when there are no bars.
-    """
-    import pandas as pd
-
-    bars = data.get("bars") or []
-    columns = ["open", "high", "low", "close", "volume"]
-    if not bars:
-        empty = pd.DataFrame(columns=columns)
-        empty.index = pd.to_datetime([])
-        return empty
-
-    df = pd.DataFrame(bars)
-    # Index by timestamp; tolerate unparseable timestamps by keeping raw values.
-    if "ts" in df.columns:
-        idx = pd.to_datetime(df["ts"], errors="coerce", utc=True)
-        if idx.isna().all():
-            idx = df["ts"]
-        df = df.drop(columns=["ts"])
-        df.index = idx
-    for col in columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.sort_index()
-    return df
-
-
 async def _fetch_ohlcv_frame(
     symbol: str, interval: str, period: str
 ) -> tuple[Any, dict[str, Any]]:
@@ -170,92 +100,6 @@ def _meta(symbol: str, interval: str, envelope: dict[str, Any], df: Any) -> dict
         "n_bars": int(len(df)),
         "disclaimer": DISCLAIMER,
     }
-
-
-# ---------------------------------------------------------------------------
-# Indicator computation (pure, given a DataFrame)
-# ---------------------------------------------------------------------------
-
-
-def _compute_indicator_frame(df: Any, names: list[str]) -> dict[str, Any]:
-    """Compute the requested indicators on ``df``; return latest-value summary.
-
-    Lazy-imports ``ta``. Each requested indicator contributes one or more
-    latest scalar values to the returned dict. Unknown indicator names are
-    recorded under ``"unknown"``.
-
-    Args:
-        df: A DataFrame with ``open/high/low/close/volume`` columns.
-        names: Lowercased indicator names to compute.
-
-    Returns:
-        A dict mapping indicator name -> latest value(s) (JSON-safe floats).
-    """
-    from ta import momentum, trend, volatility
-    from ta import volume as ta_volume
-
-    close = df["close"] if "close" in df.columns else None
-    high = df["high"] if "high" in df.columns else None
-    low = df["low"] if "low" in df.columns else None
-    vol = df["volume"] if "volume" in df.columns else None
-
-    out: dict[str, Any] = {}
-    unknown: list[str] = []
-
-    for name in names:
-        key = name.strip().lower()
-        if key == "rsi" and close is not None:
-            out["rsi"] = _last_clean(momentum.RSIIndicator(close=close).rsi())
-        elif key == "macd" and close is not None:
-            macd = trend.MACD(close=close)
-            out["macd"] = {
-                "macd": _last_clean(macd.macd()),
-                "signal": _last_clean(macd.macd_signal()),
-                "hist": _last_clean(macd.macd_diff()),
-            }
-        elif key == "bbands" and close is not None:
-            bb = volatility.BollingerBands(close=close)
-            out["bbands"] = {
-                "upper": _last_clean(bb.bollinger_hband()),
-                "middle": _last_clean(bb.bollinger_mavg()),
-                "lower": _last_clean(bb.bollinger_lband()),
-            }
-        elif key == "sma" and close is not None:
-            out["sma"] = {
-                "sma20": _last_clean(trend.SMAIndicator(close=close, window=20).sma_indicator()),
-                "sma50": _last_clean(trend.SMAIndicator(close=close, window=50).sma_indicator()),
-                "sma200": _last_clean(
-                    trend.SMAIndicator(close=close, window=200).sma_indicator()
-                ),
-            }
-        elif key == "ema" and close is not None:
-            out["ema"] = {
-                "ema12": _last_clean(trend.EMAIndicator(close=close, window=12).ema_indicator()),
-                "ema26": _last_clean(trend.EMAIndicator(close=close, window=26).ema_indicator()),
-                "ema50": _last_clean(trend.EMAIndicator(close=close, window=50).ema_indicator()),
-            }
-        elif key == "atr" and close is not None and high is not None and low is not None:
-            out["atr"] = _last_clean(
-                volatility.AverageTrueRange(high=high, low=low, close=close).average_true_range()
-            )
-        elif key == "stoch" and close is not None and high is not None and low is not None:
-            stoch = momentum.StochasticOscillator(high=high, low=low, close=close)
-            out["stoch"] = {
-                "k": _last_clean(stoch.stoch()),
-                "d": _last_clean(stoch.stoch_signal()),
-            }
-        elif key == "adx" and close is not None and high is not None and low is not None:
-            out["adx"] = _last_clean(trend.ADXIndicator(high=high, low=low, close=close).adx())
-        elif key == "obv" and close is not None and vol is not None:
-            out["obv"] = _last_clean(
-                ta_volume.OnBalanceVolumeIndicator(close=close, volume=vol).on_balance_volume()
-            )
-        else:
-            unknown.append(key)
-
-    if unknown:
-        out["unknown"] = unknown
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -326,146 +170,10 @@ async def detect_signals(symbol: str) -> dict[str, Any]:
     sym = normalize_symbol(symbol)
     df, envelope = await _fetch_ohlcv_frame(sym, "1d", "1y")
     result = _meta(sym, "1d", envelope, df)
-    signals: list[dict[str, Any]] = []
-    values: dict[str, Any] = {}
-
-    if len(df) >= 2 and "close" in df.columns:
-        from ta import momentum, trend, volatility
-
-        close = df["close"]
-
-        sma50 = trend.SMAIndicator(close=close, window=50).sma_indicator()
-        sma200 = trend.SMAIndicator(close=close, window=200).sma_indicator()
-        rsi = momentum.RSIIndicator(close=close).rsi()
-        macd_ind = trend.MACD(close=close)
-        macd_line = macd_ind.macd()
-        macd_signal = macd_ind.macd_signal()
-        bb = volatility.BollingerBands(close=close)
-        bb_high = bb.bollinger_hband()
-        bb_low = bb.bollinger_lband()
-
-        values = {
-            "close": _last_clean(close),
-            "sma50": _last_clean(sma50),
-            "sma200": _last_clean(sma200),
-            "rsi": _last_clean(rsi),
-            "macd": _last_clean(macd_line),
-            "macd_signal": _last_clean(macd_signal),
-            "bb_upper": _last_clean(bb_high),
-            "bb_lower": _last_clean(bb_low),
-        }
-
-        # Golden / death cross (SMA50 vs SMA200): compare last two valid points.
-        cross = _detect_cross(sma50, sma200)
-        if cross == "up":
-            signals.append(
-                {
-                    "name": "golden_cross",
-                    "direction": "bullish",
-                    "detail": "SMA50 crossed above SMA200",
-                }
-            )
-        elif cross == "down":
-            signals.append(
-                {
-                    "name": "death_cross",
-                    "direction": "bearish",
-                    "detail": "SMA50 crossed below SMA200",
-                }
-            )
-
-        # RSI extremes.
-        rsi_val = values["rsi"]
-        if rsi_val is not None and rsi_val < 30:
-            signals.append(
-                {
-                    "name": "rsi_oversold",
-                    "direction": "bullish",
-                    "detail": f"RSI {rsi_val:.1f} < 30",
-                }
-            )
-        elif rsi_val is not None and rsi_val > 70:
-            signals.append(
-                {
-                    "name": "rsi_overbought",
-                    "direction": "bearish",
-                    "detail": f"RSI {rsi_val:.1f} > 70",
-                }
-            )
-
-        # MACD cross.
-        macd_cross = _detect_cross(macd_line, macd_signal)
-        if macd_cross == "up":
-            signals.append(
-                {
-                    "name": "macd_bullish_cross",
-                    "direction": "bullish",
-                    "detail": "MACD crossed above signal",
-                }
-            )
-        elif macd_cross == "down":
-            signals.append(
-                {
-                    "name": "macd_bearish_cross",
-                    "direction": "bearish",
-                    "detail": "MACD crossed below signal",
-                }
-            )
-
-        # Bollinger-band breaks (latest close beyond a band).
-        last_close = values["close"]
-        if last_close is not None and values["bb_upper"] is not None and (
-            last_close > values["bb_upper"]
-        ):
-            signals.append(
-                {
-                    "name": "bollinger_break_up",
-                    "direction": "bullish",
-                    "detail": "Close above upper Bollinger band",
-                }
-            )
-        elif last_close is not None and values["bb_lower"] is not None and (
-            last_close < values["bb_lower"]
-        ):
-            signals.append(
-                {
-                    "name": "bollinger_break_down",
-                    "direction": "bearish",
-                    "detail": "Close below lower Bollinger band",
-                }
-            )
-
+    signals, values = _signals_from_frame(df)
     result["values"] = values
     result["signals"] = signals
     return result
-
-
-def _detect_cross(fast: Any, slow: Any) -> str | None:
-    """Return ``"up"``/``"down"``/``None`` for the latest cross of two series.
-
-    ``"up"`` when ``fast`` was at/below ``slow`` on the prior valid point and is
-    now above it; ``"down"`` for the opposite. Requires two aligned valid
-    points; otherwise ``None``.
-    """
-    try:
-        import pandas as pd
-
-        aligned = pd.concat([fast, slow], axis=1).dropna()
-    except Exception:
-        return None
-    if len(aligned) < 2:
-        return None
-    prev_fast = _clean_float(aligned.iloc[-2, 0])
-    prev_slow = _clean_float(aligned.iloc[-2, 1])
-    cur_fast = _clean_float(aligned.iloc[-1, 0])
-    cur_slow = _clean_float(aligned.iloc[-1, 1])
-    if None in (prev_fast, prev_slow, cur_fast, cur_slow):
-        return None
-    if prev_fast <= prev_slow and cur_fast > cur_slow:
-        return "up"
-    if prev_fast >= prev_slow and cur_fast < cur_slow:
-        return "down"
-    return None
 
 
 async def support_resistance(symbol: str) -> dict[str, Any]:
@@ -563,42 +271,6 @@ async def multi_timeframe_summary(symbol: str) -> dict[str, Any]:
         "disclaimer": DISCLAIMER,
     }
     return result
-
-
-def _summarize_timeframe(df: Any, interval: str) -> dict[str, Any]:
-    """Build a compact trend/momentum snapshot for one timeframe DataFrame."""
-    snap: dict[str, Any] = {"interval": interval, "n_bars": int(len(df))}
-    if len(df) == 0 or "close" not in df.columns:
-        snap.update({"close": None, "sma20": None, "sma50": None, "rsi": None, "trend": "unknown"})
-        return snap
-
-    from ta import momentum, trend
-
-    close = df["close"]
-    sma20 = _last_clean(trend.SMAIndicator(close=close, window=20).sma_indicator())
-    sma50 = _last_clean(trend.SMAIndicator(close=close, window=50).sma_indicator())
-    rsi = _last_clean(momentum.RSIIndicator(close=close).rsi())
-    last_close = _last_clean(close)
-
-    direction = "neutral"
-    if last_close is not None and sma50 is not None and sma20 is not None:
-        if last_close > sma50 and sma20 > sma50:
-            direction = "bullish"
-        elif last_close < sma50 and sma20 < sma50:
-            direction = "bearish"
-    elif last_close is not None and sma20 is not None:
-        direction = "bullish" if last_close > sma20 else "bearish"
-
-    snap.update(
-        {
-            "close": last_close,
-            "sma20": sma20,
-            "sma50": sma50,
-            "rsi": rsi,
-            "trend": direction,
-        }
-    )
-    return snap
 
 
 # ---------------------------------------------------------------------------

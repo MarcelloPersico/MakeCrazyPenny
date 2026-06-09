@@ -36,6 +36,11 @@ _PROVIDER_MODULES = (
     "edgar",
     "stockwatcher",
     "marketaux",
+    # Crypto extension (CONTRACT.md §16): all keyless.
+    "binance",
+    "bybit",
+    "coingecko",
+    "fear_greed",
 )
 
 for _mod in _PROVIDER_MODULES:

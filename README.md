@@ -33,6 +33,14 @@ sector's constituents and returns a stance (overweight / underweight / neutral),
 breadth, and ranked long/short ideas; the `decide_sector` prompt then debates the top
 candidates into a sector playbook. See [`plan.md`](./plan.md) §9.
 
+And it screens the **entire S&P 500 in one call**: `screen_market` runs a two-stage
+**funnel** — a cheap price-factor prefilter (momentum / trend / 52-week-high) ranks
+every constituent, then the full decision engine (evidence + regime + ATR sizing)
+runs only on the strongest candidates — and returns the best **long and short ideas
+with how to trade each** (action, conviction, stop/target, position size,
+invalidation). The constituent list is fetched live and cached. The `decide_market`
+prompt then debates the finalists. (Informational only; not investment advice.)
+
 The decision engine is enriched with **research-backed, free-data edges** (see
 [`plan.md`](./plan.md) §10): factor signals (12-1 **momentum**, 52-week-high, **trend**,
 **value/quality**) folded into the score; a **market-regime** filter (SPY trend + vol)
@@ -154,7 +162,27 @@ makecrazypenny-mcp
 python -m makecrazypenny.mcp_server
 ```
 
-For Claude Desktop, add to its MCP config:
+> **The `makecrazypenny-mcp` command must be resolvable by the MCP host.** It is
+> installed into your virtualenv's `Scripts/` (Windows) or `bin/` (macOS/Linux), so
+> it is only on `PATH` while that venv is **activated**. Since the host usually
+> launches the server in its own environment, the most reliable form is the **full
+> path** to the console script:
+>
+> ```bash
+> # Windows (PowerShell) — full path to the venv script
+> claude mcp add makecrazypenny -- "C:\path\to\repo\.venv\Scripts\makecrazypenny-mcp.exe"
+>
+> # macOS / Linux
+> claude mcp add makecrazypenny -- "/path/to/repo/.venv/bin/makecrazypenny-mcp"
+> ```
+>
+> Also note `claude` itself must be on `PATH`. With the Claude **desktop app** on
+> Windows the CLI is bundled inside the app package and is *not* on `PATH` by
+> default — invoke it by full path or add a launcher to `PATH`. Verify the server is
+> wired up with `claude mcp list` (look for `✓ Connected`).
+
+For Claude Desktop, add to its MCP config (use the full path to the script, as above,
+if the bare command is not on `PATH`):
 
 ```json
 {
@@ -174,6 +202,12 @@ For a **whole sector**, run the **`decide_sector`** prompt (e.g. `tech`, `health
 `energy`): the host calls `scan_sector` for the quant ranking, debates the top
 long/short candidates, and synthesizes a sector playbook. Or call the tools directly —
 `list_sectors`, `sector_constituents`, `scan_sector`.
+
+For the **whole S&P 500**, run the **`decide_market`** prompt: the host calls
+`screen_market` (the prefilter → deep-dive funnel), then debates the best long and
+short finalists and lays out the plan for each. Or call `screen_market` directly for
+the quant baseline (`shortlist` = candidates deep-dived per side, `top_n` = ideas per
+side).
 
 ## Run the CLI (deterministic quant decision)
 
@@ -197,7 +231,9 @@ python -m makecrazypenny.orchestration.main AAPL --mode report --depth 2
 ```
 
 ```
-usage: makecrazypenny [-h] [--sector NAME] [--limit N] [--top N] [--regime] [--backtest] [--mode {decide,report}] [--depth DEPTH] [SYMBOL]
+usage: makecrazypenny [-h] [--sector NAME] [--limit N] [--top N] [--market] [--regime] [--backtest]
+                      [--crypto SYMBOL] [--crypto-market] [--crypto-regime] [--interval TF] [--leverage N]
+                      [--mode {decide,report}] [--depth DEPTH] [SYMBOL]
 ```
 
 The `decide` output now also shows the **sized trade** (stop / target / position %) and
@@ -209,6 +245,42 @@ verdict, conviction, bull/bear cases, risks, the quant factor breakdown, and a t
 run the full debate via the MCP server — always with the not-investment-advice
 disclaimer. It needs **no SDK or API key**. `report` mode still drives the SDK
 orchestrator and exits non-zero (no traceback) if the SDK is absent.
+
+## Crypto — very-short-window leveraged perpetuals
+
+A parallel **crypto track** for leveraged perpetual-futures trading, built on the same
+engine but tuned for short timeframes and the derivatives metrics that matter under
+leverage. All data is **keyless**: Binance + Bybit (perp klines, funding rate, open
+interest, long/short ratio), CoinGecko (market cap / BTC dominance), and the
+Alternative.me Fear & Greed Index. On a US IP, Binance's geo-block trips the registry's
+fallback chain straight to Bybit automatically.
+
+```bash
+# Leverage-aware decision: action + suggested leverage, liquidation price, stop/target
+makecrazypenny --crypto BTCUSDT --interval 15m --leverage 20
+makecrazypenny --crypto ETH                 # BTC, ETH/USDT, BTC-USD all normalize
+
+# Screen the most-liquid perps -> best leveraged long/short setups
+makecrazypenny --crypto-market --interval 15m --top 3
+
+# Crypto market regime (BTC trend + vol + Fear & Greed)
+makecrazypenny --crypto-regime
+```
+
+Beyond the BUY/SHORT/AVOID verdict, every crypto decision carries a **leverage plan**:
+suggested leverage (capped so the ATR stop sits *inside* the estimated liquidation
+price), liquidation price, stop/target, margin %, and the estimated funding cost over
+the hold — all scaled by the crypto regime. The derivatives signals are scored as
+**contrarian at extremes** (crowded longs / high funding / extreme greed warn of a
+squeeze). Tunable via `MCP_CRYPTO_*` env vars (default preset: ≤20x, ~2.5% risk/trade).
+
+New MCP **tools** — `crypto_decide`, `crypto_evidence`, `derivatives`, `funding_rate`,
+`crypto_technicals`, `crypto_regime`, `crypto_screen`, `crypto_finalize_decision` — and
+**prompts** `decide_crypto`, `bull_case_crypto` / `bear_case_crypto`, `decide_crypto_market`
+(the host runs the leverage-aware bull/bear debate on your own subscription).
+
+> Leverage amplifies losses and liquidation prices are estimates. Informational only;
+> NOT investment advice.
 
 ## Run the dashboard (Streamlit GUI)
 

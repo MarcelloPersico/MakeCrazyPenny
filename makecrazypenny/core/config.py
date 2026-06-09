@@ -37,6 +37,17 @@ CAPABILITIES: tuple[str, ...] = (
     "price_targets",
     "upgrades_downgrades",
     "sec_filings",
+    # --- Crypto extension (CONTRACT.md §16) -------------------------------
+    # A parallel vocabulary for digital-asset / perpetual-futures data. These
+    # names are routed to crypto providers only; the equity chains above are
+    # untouched (the registry keys chains by capability, not by asset class).
+    "crypto_ohlcv",
+    "crypto_quote",
+    "funding_rate",
+    "open_interest",
+    "long_short_ratio",
+    "crypto_sentiment",
+    "crypto_global",
 )
 
 CAPABILITY_CHAINS: dict[str, list[str]] = {
@@ -52,6 +63,15 @@ CAPABILITY_CHAINS: dict[str, list[str]] = {
     "price_targets": ["finnhub", "fmp"],
     "upgrades_downgrades": ["fmp", "finnhub"],
     "sec_filings": ["edgar"],
+    # --- Crypto extension. Binance is richest but geo-blocked from US IPs;
+    # the chain falls through to Bybit automatically on any runtime failure. ---
+    "crypto_ohlcv": ["binance", "bybit"],
+    "crypto_quote": ["binance", "bybit", "coingecko"],
+    "funding_rate": ["binance", "bybit"],
+    "open_interest": ["binance", "bybit"],
+    "long_short_ratio": ["binance", "bybit"],
+    "crypto_sentiment": ["fear_greed"],
+    "crypto_global": ["coingecko"],
 }
 
 # Per-capability cache TTLs in seconds (see CONTRACT.md §8.5).
@@ -68,6 +88,14 @@ _DEFAULT_TTLS: dict[str, float] = {
     "price_targets": 3600.0,
     "upgrades_downgrades": 3600.0,
     "fundamentals": 3600.0,
+    # Crypto: short windows demand fresh data; derivatives move fast.
+    "crypto_ohlcv": 60.0,
+    "crypto_quote": 15.0,
+    "funding_rate": 60.0,
+    "open_interest": 60.0,
+    "long_short_ratio": 300.0,
+    "crypto_sentiment": 600.0,
+    "crypto_global": 300.0,
 }
 
 # Fallback TTL for any capability not explicitly listed above.
@@ -160,6 +188,22 @@ class Settings:
     finnhub_api_key: str | None = None
     fmp_api_key: str | None = None
     marketaux_api_key: str | None = None
+    #: Optional CoinGecko demo key (sent as a header when present). Never required.
+    coingecko_api_key: str | None = None
+
+    #: Crypto exchange REST base URLs (overridable for proxies / regional mirrors).
+    binance_base_url: str = "https://fapi.binance.com"
+    bybit_base_url: str = "https://api.bybit.com"
+
+    #: Crypto leverage-risk policy (informational sizing; tunable per §16). The
+    #: defaults below are the "aggressive" preset chosen at build time.
+    crypto_max_leverage: float = 20.0
+    crypto_risk_per_trade: float = 0.025
+    crypto_maint_margin_rate: float = 0.005
+    crypto_target_vol: float = 0.80
+    #: The ATR stop must sit at least this fraction inside the liquidation distance
+    #: (0.5 => liquidation is >=1.5x the stop distance away from entry).
+    crypto_liq_buffer: float = 0.5
 
     cache_dir: Path = field(default_factory=lambda: Path(tempfile.gettempdir()) / ".mcpenny_cache")
     capability_chains: dict[str, list[str]] = field(
@@ -201,6 +245,7 @@ class Settings:
             "FINNHUB_API_KEY": self.finnhub_api_key,
             "FMP_API_KEY": self.fmp_api_key,
             "MARKETAUX_API_KEY": self.marketaux_api_key,
+            "COINGECKO_API_KEY": self.coingecko_api_key,
         }
         if env_var in mapping:
             # A known key: the injected Settings is authoritative. An explicit
@@ -257,6 +302,14 @@ class Settings:
             finnhub_api_key=os.environ.get("FINNHUB_API_KEY") or None,
             fmp_api_key=os.environ.get("FMP_API_KEY") or None,
             marketaux_api_key=os.environ.get("MARKETAUX_API_KEY") or None,
+            coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
+            binance_base_url=os.environ.get("MCP_BINANCE_BASE_URL") or "https://fapi.binance.com",
+            bybit_base_url=os.environ.get("MCP_BYBIT_BASE_URL") or "https://api.bybit.com",
+            crypto_max_leverage=_float_env("MCP_CRYPTO_MAX_LEVERAGE", 20.0),
+            crypto_risk_per_trade=_float_env("MCP_CRYPTO_RISK_PER_TRADE", 0.025),
+            crypto_maint_margin_rate=_float_env("MCP_CRYPTO_MAINT_MARGIN", 0.005),
+            crypto_target_vol=_float_env("MCP_CRYPTO_TARGET_VOL", 0.80),
+            crypto_liq_buffer=_float_env("MCP_CRYPTO_LIQ_BUFFER", 0.5),
             cache_dir=cache_dir,
             capability_chains=_resolve_chains_from_env(CAPABILITY_CHAINS),
             edgar_user_agent=os.environ.get("MCP_EDGAR_USER_AGENT") or DEFAULT_EDGAR_USER_AGENT,

@@ -40,9 +40,15 @@ async def test_tools_and_prompts_registered() -> None:
     tools = {t.name for t in await srv.mcp.list_tools()}
     prompts = {p.name for p in await srv.mcp.list_prompts()}
     assert {"decide", "gather_evidence", "finalize_decision", "technical_analysis"} <= tools
-    assert {"list_sectors", "sector_constituents", "scan_sector"} <= tools
+    assert {"list_sectors", "sector_constituents", "scan_sector", "screen_market"} <= tools
     assert {"market_regime", "backtest", "build_portfolio", "build_sector_portfolio"} <= tools
-    assert {"decide", "bull_case", "bear_case", "judge", "decide_sector"} == prompts
+    # Crypto extension (CONTRACT.md §16).
+    assert {
+        "crypto_decide", "crypto_evidence", "derivatives", "funding_rate",
+        "crypto_technicals", "crypto_regime", "crypto_screen", "crypto_finalize_decision",
+    } <= tools
+    assert {"decide", "bull_case", "bear_case", "judge", "decide_sector", "decide_market"} <= prompts
+    assert {"decide_crypto", "bull_case_crypto", "bear_case_crypto", "decide_crypto_market"} <= prompts
 
 
 def test_prompt_builders_normalize_symbol_and_mention_flow() -> None:
@@ -201,6 +207,79 @@ async def test_scan_sector_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out["disclaimer"]
 
 
+# ---------------------------------------------------------------------------
+# Crypto tools + prompts (CONTRACT.md §16)
+# ---------------------------------------------------------------------------
+
+CRYPTO_BULLISH_DOSSIER: dict[str, Any] = {
+    "symbol": "BTCUSDT",
+    "signals": {"signals": [{"name": "golden_cross", "direction": "bullish"}]},
+    "factors": {"momentum_12_1": 0.2, "trend_200": 0.08, "pct_52w_high": 0.98, "last_close": 42000.0, "atr14": 300.0},
+    "mtf": {"timeframes": {"5m": {"trend": "bullish"}, "15m": {"trend": "bullish"}}},
+    "derivatives": {"funding": {"rate": -0.0002, "annualized": -0.2}, "oi_change_pct": 0.05, "price_change_pct": 0.02, "long_short": {"ratio": 0.5}},
+    "sentiment": {"fear_greed": {"value": 20}},
+}
+
+
+async def test_crypto_decide_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    from makecrazypenny.core.types import TradeDecision
+
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None):
+        return TradeDecision(
+            symbol=symbol, action="BUY", direction="LONG", conviction=0.5, asset_class="crypto",
+            leverage={"suggested_leverage": 20.0, "liquidation_price": 40000.0, "direction": "LONG"},
+            disclaimer="x",
+        )
+
+    monkeypatch.setattr(srv, "engine_decide_crypto", fake_decide)
+    out = json.loads(await srv.crypto_decide_tool("btc", interval="15m", leverage_cap=20.0))
+    assert out["symbol"] == "BTCUSDT"
+    assert out["asset_class"] == "crypto"
+    assert out["leverage"]["suggested_leverage"] == 20.0
+
+
+async def test_derivatives_tool_tolerates_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from makecrazypenny.servers import crypto as cx
+
+    async def boom(symbol: str, interval: str = "5m"):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(cx, "derivatives", boom)
+    out = json.loads(await srv.derivatives_tool("BTC"))
+    assert out["symbol"] == "BTCUSDT"
+    assert out["derivatives"]["_error"].startswith("RuntimeError")
+
+
+async def test_crypto_finalize_decision_applies_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_gather(symbol: str, *, interval: str = "15m", settings: Any = None):
+        return CRYPTO_BULLISH_DOSSIER
+
+    async def passthrough(decision, dossier, *, interval="15m", leverage_cap=None, settings=None):
+        decision.asset_class = "crypto"
+        return decision
+
+    monkeypatch.setattr(srv, "gather_crypto_evidence", fake_gather)
+    monkeypatch.setattr(srv, "enrich_crypto_decision", passthrough)
+    out = json.loads(
+        await srv.crypto_finalize_decision_tool("btc", action="SHORT", conviction=0.3, summary="fade it")
+    )
+    assert out["action"] == "SHORT"  # host verdict overrides the bullish quant
+    assert out["method"] == "debate"
+    assert out["summary"] == "fade it"
+    assert out["net_score"] > 0  # quant scores preserved
+
+
+def test_crypto_prompt_builders() -> None:
+    decide = srv.build_decide_crypto_prompt("btc", "5m", 2)
+    assert "BTCUSDT" in decide
+    assert "LEVERAGE" in decide and "liquidation" in decide.lower()
+    assert "crypto_finalize_decision" in decide
+    assert "NOT investment advice" in decide
+    assert "BTCUSDT" in srv.build_bull_crypto_prompt("btc")
+    assert "BTCUSDT" in srv.build_bear_crypto_prompt("btc")
+    assert "crypto_screen" in srv.build_decide_crypto_market_prompt(3, "15m")
+
+
 def test_decide_sector_prompt_builder() -> None:
     text = srv.build_decide_sector_prompt("healthcare", 3)
     assert "Health Care" in text
@@ -208,6 +287,37 @@ def test_decide_sector_prompt_builder() -> None:
     assert "NOT investment advice" in text
     # Bad top_n must not raise.
     assert "Technology" in srv.decide_sector_prompt("tech", top_n="oops")
+
+
+async def test_screen_market_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    from makecrazypenny.core.types import MarketScreen
+
+    async def fake_screen(*, shortlist=15, top_n=3, force_refresh=False, **_: Any):
+        return MarketScreen(
+            universe="S&P 500",
+            universe_source="live",
+            universe_count=503,
+            top_longs=[{"symbol": "AAPL", "action": "BUY"}][:top_n],
+            top_shorts=[{"symbol": "XYZ", "action": "SHORT"}][:top_n],
+            summary="ok",
+            disclaimer="x",
+        )
+
+    monkeypatch.setattr(srv, "screen_market", fake_screen)
+    out = json.loads(await srv.screen_market_tool(shortlist=10, top_n=1))
+    assert out["universe_source"] == "live"
+    assert out["universe_count"] == 503
+    assert out["top_longs"][0]["symbol"] == "AAPL"
+    assert out["disclaimer"]
+
+
+def test_decide_market_prompt_builder() -> None:
+    text = srv.build_decide_market_prompt(3)
+    assert "S&P 500" in text
+    assert "screen_market" in text
+    assert "NOT investment advice" in text
+    # Bad top_n must not raise.
+    assert "screen_market" in srv.decide_market_prompt(top_n="oops")
 
 
 # ---------------------------------------------------------------------------

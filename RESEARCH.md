@@ -85,6 +85,34 @@ costs**; judge edges by **PSR/DSR > 0.95**, not raw Sharpe; expect alpha to deca
 
 ---
 
+## 5. Crypto perpetuals — leverage, funding & positioning (CONTRACT.md §16)
+
+Crypto perpetual futures have no equity analogue for the most actionable short-window signals, so
+the crypto engine weights **derivatives microstructure** heavily and treats the crowd as a
+*contrarian* tell at extremes:
+
+- **Funding rate** — the periodic payment that tethers a perp to spot. Persistently positive funding
+  means longs are crowded and *paying* to hold; that overhang is squeeze fuel (contrarian-bearish at
+  extremes), and vice-versa. Scored on the annualized rate; the perp **basis** (mark vs index) is the
+  same premium so it is surfaced but not double-scored.
+- **Open interest × price (the matrix)** — rising OI *confirms* a price move (new money / new
+  positions); falling OI means the move is an unwind or short-cover and is faded. The four quadrants
+  give a clean directional read.
+- **Long/short account ratio** — when positioning is overwhelmingly one-sided, fade it.
+- **Fear & Greed** — extreme greed precedes pullbacks; extreme fear precedes bounces (contrarian).
+- **Trend backdrop** — "don't fight the daily BTC trend": BTC above/below its long SMA + 12-1
+  time-series momentum (Moskowitz-Ooi-Pedersen; Faber) sets a risk-on/off gross-exposure scalar, with
+  a crypto-tuned vol overlay (Moreira-Muir for *drawdown control*, not free Sharpe) and a Fear & Greed
+  extreme trim.
+
+**Leverage is sized for survival, not maximization.** The protective stop is ATR-based; leverage is
+**capped so the stop triggers before liquidation** (liquidation distance ≈ `1/L − mmr`, held a buffer
+beyond the stop), and the position is sized so a stop-out costs a fixed fraction of equity
+(half-Kelly logic from §2, applied to a leveraged book). Liquidation is an isolated-margin **estimate**
+(it ignores fee/maintenance tiers). Crypto markets are 24/7, reflexive, and dominated by leverage and
+sentiment — alpha decays fast and funding is a real carry cost, so size humbly and respect the
+invalidation level. Informational only; NOT investment advice.
+
 ## Caveats this research forces us to keep
 
 1. **Alpha decays** (McLean-Pontiff ~58% post-publication) — these signals are public; size humbly.

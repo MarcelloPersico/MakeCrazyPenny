@@ -75,6 +75,7 @@ makecrazypenny/core/config.py       Settings + CAPABILITY_CHAINS default
 makecrazypenny/core/disclaimer.py   DISCLAIMER: str; with_disclaimer(text)->str
 makecrazypenny/core/errors.py       error taxonomy (see §6)
 makecrazypenny/core/sectors.py      curated GICS sector -> constituents map + resolver (§10.5)
+makecrazypenny/core/universe.py     live-fetched + cached S&P 500 universe (§10.5.1)
 makecrazypenny/analysis/factors.py  factor signals (momentum/trend/value/quality) (§10.7.1)
 makecrazypenny/analysis/risk.py     ATR stops + vol-target/fractional-Kelly sizing (§10.7.2)
 makecrazypenny/analysis/regime.py   market-regime filter -> gross-exposure scalar (§10.7.3)
@@ -106,8 +107,9 @@ makecrazypenny/orchestration/__init__.py                                      [D
 makecrazypenny/orchestration/agents.py  AgentDefinitions + build_options() (report mode)
 makecrazypenny/orchestration/debate.py  deterministic decision engine (see §10.3)
 makecrazypenny/orchestration/market.py  sector-wide scan engine (see §10.5)
+makecrazypenny/orchestration/screen.py  whole-universe prefilter->deep-dive funnel (§10.5.1)
 makecrazypenny/orchestration/portfolio.py  conviction x inverse-vol portfolio builder (§10.6)
-makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report | --sector | --regime | --backtest)
+makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report | --sector | --market | --regime | --backtest)
 tests/                                 mirrors source (see §11)
 ```
 
@@ -169,6 +171,7 @@ The debate-driven decision engine adds three value types (same conventions: plai
 | `DebateTranscript` | `symbol: str`, `rounds: int`, `arguments: list[DebateArgument]`; helpers `for_side(side)`, `latest(side)` |
 | `TradeDecision` | `symbol`, `action` (`"BUY"`/`"SHORT"`/`"AVOID"`), `direction` (`"LONG"`/`"SHORT"`/`"FLAT"`), `conviction: float` (0..1), `horizon`, `suggested_sizing`, `summary`, `rationale: list[str]`, `bull_case: list[str]`, `bear_case: list[str]`, `risks: list[str]`, `invalidation: str \| None`, `net_score`, `bull_score`, `bear_score`, `factors: list[dict]`, `method` (`"quant"`/`"debate"`), `data_quality: dict`, `sizing: dict` (stop/target/position % — §10.7.2), `regime: dict` (market regime — §10.7.3), `transcript: DebateTranscript \| None`, `note: str \| None`, `disclaimer: str` |
 | `SectorScan` | `sector`, `stance` (`"overweight"`/`"underweight"`/`"neutral"`), `n_requested`, `n_analyzed`, `net_tilt: float`, `avg_conviction: float`, `breadth: dict` (buy/short/avoid + bullish_pct/bearish_pct), `rankings: list[dict]`, `top_longs: list[dict]`, `top_shorts: list[dict]`, `errors: list[dict]`, `method`, `summary`, `disclaimer` |
+| `MarketScreen` | `universe`, `universe_source` (`"live"`/`"cache"`/`"fallback"`/`"explicit"`), `universe_count`, `as_of`, `n_prefiltered`, `n_evaluated`, `regime: dict`, `top_longs: list[dict]` (full `TradeDecision`s), `top_shorts: list[dict]`, `long_shortlist: list[dict]`, `short_shortlist: list[dict]`, `errors: list[dict]`, `method`, `summary`, `disclaimer` |
 
 `TradeDecision` always carries the not-investment-advice `disclaimer` and the quant
 `factors` breakdown for transparency, even when an LLM judge sets the final call.
@@ -559,7 +562,11 @@ gather_evidence(symbol)        # fan out across ALL capability logic fns (tolera
 - **`score_evidence(dossier) -> dict`** — pure. Weights technical signals (golden/death cross
   strongest), blended sentiment, analyst-consensus tilt, price-target upside, and
   congressional/insider net flow into `factors` + `net_score`/`bull_score`/`bear_score`, plus a
-  cross-check `divergence_penalty`. Positive = bullish.
+  cross-check `divergence_penalty`. Positive = bullish. The two analyst signals are **de-meaned
+  against their structural optimism skew** (consensus tilt vs a +0.30 baseline; target upside vs a
+  +10% baseline) so an ordinary stock scores ~0 on both, and flow is **dollar-size-weighted**
+  (insider `value` / congress `amount_range` midpoint; unit weight when unknown). Price factors are
+  computed on **split/dividend-adjusted** bars (yfinance `auto_adjust=True`).
 - **`decide_from_scores(symbol, scored, *, transcript=None, verdict=None, method="quant",
   note=None) -> TradeDecision`** — pure. Quant rule: take a position only when net passes the
   threshold, conviction passes the floor, **and** the evidence is corroborated (≥2 categories or
@@ -622,6 +629,39 @@ debates the top long/short candidates and synthesizes a sector playbook (stance 
 AI-free and offline-testable; the AI debate over a scan is run by the host (the user's
 subscription), like the single-ticker flow.
 
+#### 10.5.1 `screen.py` — whole-universe screen (the S&P 500 funnel)
+
+`core/universe.py` supplies the universe: **`fetch_sp500(*, settings=None, force_refresh=False)
+-> dict`** live-fetches the current S&P 500 constituents from a maintained, key-free CSV,
+normalizes symbols to the yfinance convention (`BRK.B` → `BRK-B`), and caches them under the
+cache dir with a weekly TTL. Resolution order is **live → (stale) cache → curated-sector
+fallback**, and the result is tagged with its `source` so callers know how fresh it is. Never
+raises; the blocking HTTP/disk work runs via `asyncio.to_thread`.
+
+`orchestration/screen.py` runs a two-stage **funnel** (running the full evidence engine on 500
+names per call is neither fast nor free):
+
+- **Stage 1 — prefilter (whole universe, cheap).** `prefilter_universe(symbols)` computes
+  price-only factors from a single free OHLCV pull per name (no `.info`, no key) and scores each
+  with `prefilter_score` (a momentum/trend/52-week-high composite mirroring the §10.3 factor
+  weights). Bounded by `MAX_PREFILTER_CONCURRENCY=8`; one bad name becomes an `errors` entry.
+- **Stage 2 — deep dive (shortlist only).** The strongest `shortlist` long candidates and
+  `shortlist` short candidates are deep-dived with the full `decide` engine (evidence + regime +
+  ATR sizing) under `MAX_DEEP_CONCURRENCY=5`. The best `top_n` BUY and `top_n` SHORT *verdicts*
+  are surfaced as complete `TradeDecision`s — so the result says both **what** and **how** to
+  trade (entry/stop/target, size, invalidation).
+
+**`screen_market(*, symbols=None, shortlist=15, top_n=3, force_refresh=False, settings=None) ->
+MarketScreen`** ties it together (universe → regime once → prefilter → deep dive → aggregate);
+an explicit `symbols` list overrides the fetched universe. Never raises — data/fetch failures
+are captured under `errors`.
+
+**MCP surface** (in `mcp_server.py`): tool `screen_market` (deterministic) and the
+`decide_market` prompt — the host screens the universe, then debates the long/short finalists
+and lays out each plan. **CLI:** `makecrazypenny --market [--shortlist N] [--top N]` prints the
+screen. AI-free and offline-testable (monkeypatch the two fetch points + the universe fetch);
+the debate over the screen is run by the host.
+
 ### 10.6 `portfolio.py` — portfolio construction
 
 `build_portfolio(symbols, *, max_positions, max_weight, regime=None) -> dict` runs the engine on
@@ -676,6 +716,8 @@ Mirror the source tree. All tests deterministic and offline.
 | `test_debate.py` | quant backbone scores bullish/bearish/thin dossiers correctly; `decide_from_scores` maps to BUY/SHORT/AVOID and a host verdict overrides; `gather_evidence` tolerates failures; `decide` is deterministic `method="quant"`; CLI output is ASCII. |
 | `test_mcp_server.py` | FastMCP tools + prompts registered (incl. sector tools + `decide_sector`); prompt builders normalize the symbol and embed the bull/bear/judge flow; `decide`/`gather_evidence`/`finalize_decision` tools return correct JSON (verdict overrides quant); sector tools resolve + scan; per-domain tools tolerate a single failure. All AI-free/offline. |
 | `test_market.py` | sector resolver (aliases/case/substring/unknown); `aggregate_scan` ranks, classifies breadth, and derives overweight/underweight/neutral stance; `scan_sector` analyses constituents (evidence monkeypatched), respects `limit`, tolerates a failed name, and errors cleanly on an unknown sector. |
+| `test_universe.py` | symbol normalization (`BRK.B`→`BRK-B`); CSV parse dedups + skips blanks; `fetch_sp500` resolution order live→cache→fallback, `force_refresh` bypasses cache, stale cache beats a failed live fetch (fetch + cache dir monkeypatched). |
+| `test_screen.py` | `prefilter_score` direction/composition; `prefilter_universe` ranks + collects errors; `screen_market` selects top-N longs/shorts from the deep-dive verdicts, caps each side, limits the deep dive to the shortlist, uses the live universe, tolerates a deep-dive failure, and handles an empty universe (both fetch points monkeypatched). |
 | `test_analysis.py` | factor signals (momentum/trend/52w-high/vol; value/quality extraction) on synthetic bars; ATR + half-Kelly + `position_sizing` (stops, regime scaling, FLAT=0); regime risk-on/off/caution; backtest long/flat runs + PSR/DSR monotonicity + norm CDF/PPF sanity. All pure/offline. |
 | `test_portfolio.py` | `_weight_side` caps + normalizes + inverse-vol tilt; `build_portfolio` weights, regime-scaled exposure (evidence/regime monkeypatched); unknown sector errors cleanly. |
 
@@ -772,3 +814,97 @@ CAPABILITY_CHAINS = {
    `ProviderRegistry` is the provider-side hub and no Layer-1 server depends on another except
    `synthesis`.
 ```
+
+---
+
+## 16. Crypto extension — very-short-window leveraged perpetuals
+
+A **parallel crypto track** added alongside the frozen equity path (it reuses the asset-agnostic
+quant cores and leaves §4's equity capabilities untouched). Built for short-window **leveraged
+perpetual-futures** trading. All data sources are **keyless**, matching the keyless-first ethos.
+
+### 16.1 New capabilities (routed to crypto providers only)
+
+Added to `core/config.CAPABILITIES` / `CAPABILITY_CHAINS` (the registry keys chains by capability,
+so there is no asset-class collision with §4):
+
+```
+crypto_ohlcv    -> [binance, bybit]            # perpetual klines (1m..1d)
+crypto_quote    -> [binance, bybit, coingecko]
+funding_rate    -> [binance, bybit]
+open_interest   -> [binance, bybit]            # returns current + a short history list
+long_short_ratio-> [binance, bybit]
+crypto_sentiment-> [fear_greed]                # Alternative.me Fear & Greed
+crypto_global   -> [coingecko]                 # total mcap, BTC/ETH dominance
+```
+
+`crypto_ohlcv` pulls **perpetual** klines (what you trade leveraged). Binance global
+(`fapi.binance.com`) is geo-blocked (HTTP 451) from US IPs; that is a normal runtime failure, so
+`registry.fetch` records it and falls through to **Bybit** automatically.
+
+### 16.2 New providers (Layer 0, keyless; `httpx`)
+
+| Provider | Capabilities | Endpoints |
+|---|---|---|
+| `binance` | the five derivatives caps + `crypto_quote` | `/fapi/v1/klines`, `/fapi/v1/premiumIndex`, `/futures/data/openInterestHist`, `/futures/data/globalLongShortAccountRatio`, `/fapi/v1/ticker/24hr` |
+| `bybit` | same | `/v5/market/kline`, `/v5/market/tickers` (price+funding+OI), `/v5/market/open-interest`, `/v5/market/account-ratio` |
+| `coingecko` | `crypto_global`, `crypto_quote` | `/api/v3/global`, `/api/v3/coins/markets` (optional demo key header) |
+| `fear_greed` | `crypto_sentiment` | `https://api.alternative.me/fng/` |
+
+### 16.3 New core types (`core/types.py`)
+
+`FundingRate` (rate, mark/index, `annualized()`, `basis()`), `OpenInterest`, `LongShortRatio`,
+`CryptoGlobal`. `TradeDecision` gains two back-compat optional fields: `asset_class`
+(`"equity"`|`"crypto"`) and `leverage: dict` (the leverage plan; empty for equities).
+`core/symbols.py` canonicalizes any input (`BTC`/`BTC-USD`/`BTC/USDT`/`BTCUSD` → `BTCUSDT`).
+
+### 16.4 New analysis cores (`analysis/`)
+
+- `indicators.py` — shared `ta`/`pandas` frame+indicator+signal helpers, extracted from
+  `servers/technical.py` so both the equity `technical` and the crypto server reuse them (keeps the
+  "servers don't import servers" rule).
+- `leverage.py` — `liquidation_price`, `max_safe_leverage` (caps leverage so the ATR stop sits
+  inside liquidation by `crypto_liq_buffer`), `funding_cost`, and `leverage_plan` (suggested
+  leverage, liquidation, stop/target, notional/margin %, funding cost). Sized to
+  `crypto_risk_per_trade`. The *suggested* leverage runs at `DEFAULT_LEVERAGE_FRACTION` (½) of the
+  max-safe value — same notional/risk, double the liquidation cushion against wicks and the
+  model's own approximations; `max_safe_leverage` is still reported alongside.
+- `crypto_metrics.py` — `funding_signal` (contrarian, centered on the +0.01%/8h equilibrium
+  baseline so resting funding scores 0), `oi_price_signal` (OI×price matrix), `long_short_signal`
+  (contrarian), `fear_greed_signal` (contrarian **at the extremes only**: ≥75 / ≤25; mid-range
+  scores 0), `basis_value`.
+- `crypto_regime.py` — BTC trend + 12-1 momentum + crypto-tuned vol overlay (daily vol annualized
+  with √365 — crypto trades every calendar day) + Fear & Greed extreme overlay →
+  risk-on/caution/risk-off + a 0..1 gross-exposure scalar.
+
+### 16.5 Server, engine, screen (Layers 1–2)
+
+- `servers/crypto.py` — `crypto_ohlcv`, `crypto_indicators`, `crypto_signals`, `multi_timeframe`
+  (5m/15m/1h), `derivatives` (funding+OI(+change)+long/short+basis, tolerant), `crypto_sentiment`.
+- `orchestration/crypto.py` — `gather_crypto_evidence` → `score_crypto_evidence` (reuses the equity
+  signal/factor scorers with **interval-aware saturations** — the 252/200-bar factor windows span
+  hours on intraday bars, so the daily thresholds are rescaled by √(interval/1d), anchored at the
+  crypto-daily values; vol is annualized to the bar frequency — + adds the crypto derivatives
+  factors) → reuses `decide_from_scores` → `enrich_crypto_decision` (attaches `crypto_regime` +
+  `leverage_plan`, sets `asset_class="crypto"`, horizon from the interval).
+  `decide_crypto(symbol, interval, leverage_cap)` ties it together. The Binance/Bybit providers
+  discover each symbol's real funding interval (4h/1h perps exist) instead of assuming 8h, and a
+  missing funding rate raises (falls through the chain) rather than masquerading as 0.
+- `core/crypto_universe.py` (top perps by 24h volume; live→cache→fallback) +
+  `orchestration/crypto_screen.py` (two-stage funnel → best leveraged long/short `TradeDecision`s).
+
+### 16.6 MCP + CLI surface
+
+- **Tools:** `crypto_decide`, `crypto_evidence`, `derivatives`, `funding_rate`, `crypto_technicals`,
+  `crypto_regime`, `crypto_screen`, `crypto_finalize_decision`.
+- **Prompts (host-run):** `decide_crypto`, `bull_case_crypto`, `bear_case_crypto`,
+  `decide_crypto_market` — tuned to leverage/liquidation/funding risk and the contrarian derivatives.
+- **CLI:** `makecrazypenny --crypto SYMBOL [--interval TF] [--leverage N]`, `--crypto-market`,
+  `--crypto-regime`.
+
+### 16.7 Settings (the "aggressive" preset; env-overridable)
+
+`crypto_max_leverage=20`, `crypto_risk_per_trade=0.025`, `crypto_maint_margin_rate=0.005`,
+`crypto_target_vol=0.80`, `crypto_liq_buffer=0.5`, plus `coingecko_api_key`, `binance_base_url`,
+`bybit_base_url`. AI-free and offline-testable; the leverage plan is informational only (carries the
+`DISCLAIMER`) — liquidation is an isolated-margin **estimate**.

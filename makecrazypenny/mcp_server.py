@@ -39,11 +39,22 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .analysis.backtest import backtest as run_backtest
+from .analysis.crypto_regime import crypto_regime as run_crypto_regime
 from .analysis.regime import market_regime
 from .core.config import Settings
 from .core.disclaimer import DISCLAIMER
 from .core.sectors import list_sectors, resolve_sector
 from .core.sectors import sector_constituents as _sector_constituents
+from .core.symbols import canonical_crypto
+from .orchestration.crypto import (
+    decide_crypto as engine_decide_crypto,
+)
+from .orchestration.crypto import (
+    enrich_crypto_decision,
+    gather_crypto_evidence,
+    score_crypto_evidence,
+)
+from .orchestration.crypto_screen import screen_crypto
 from .orchestration.debate import (
     decide as engine_decide,
 )
@@ -55,6 +66,7 @@ from .orchestration.debate import (
 )
 from .orchestration.market import scan_sector
 from .orchestration.portfolio import build_portfolio, build_sector_portfolio
+from .orchestration.screen import screen_market
 from .servers._common import json_default, normalize_symbol
 
 mcp = FastMCP(
@@ -354,6 +366,218 @@ async def scan_sector_tool(sector: str, limit: int = 12, top_n: int = 5) -> str:
     return _dumps(scan.to_dict())
 
 
+@mcp.tool(
+    name="screen_market",
+    title="Screen the whole S&P 500 -> best longs & shorts",
+    description=(
+        "Screen an entire universe (the S&P 500 by default) in one call and return "
+        "the best long and short trade ideas WITH how to trade each. Uses a two-stage "
+        "funnel: a cheap price-factor prefilter (momentum/trend/52w-high) ranks every "
+        "constituent, then the full decision engine (evidence + regime + ATR sizing) "
+        "runs only on the strongest candidates. Returns top_longs/top_shorts as full "
+        "TradeDecisions (action, conviction, stop/target, position size, invalidation), "
+        "the regime, and the prefilter shortlist. AI-free, no API key. The S&P 500 list "
+        "is fetched live and cached. `shortlist` = candidates deep-dived per side; "
+        "`top_n` = ideas surfaced per side. Use this as the quant baseline before "
+        "debating the finalists."
+    ),
+)
+async def screen_market_tool(shortlist: int = 15, top_n: int = 3, force_refresh: bool = False) -> str:
+    """Return the whole-market :class:`MarketScreen` as JSON."""
+    screen = await screen_market(shortlist=shortlist, top_n=top_n, force_refresh=force_refresh)
+    return _dumps(screen.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Crypto tools — perpetual futures, leverage-aware (CONTRACT.md §16)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="crypto_decide",
+    title="Leverage-aware crypto decision (BUY/SHORT/AVOID)",
+    description=(
+        "Deterministic baseline decision for a crypto perpetual: gathers multi-timeframe "
+        "price action plus the derivatives metrics that matter for leverage (funding rate, "
+        "open interest, long/short ratio, basis) and Fear & Greed, scores them, and returns a "
+        "TradeDecision WITH a leverage plan — suggested leverage, liquidation price, stop/target, "
+        "margin %, and funding cost — sized so the stop sits inside liquidation. No AI, no API key. "
+        "`interval` is the entry timeframe (1m..1d; default 15m); `leverage_cap` caps suggested "
+        "leverage. Use this as the quant baseline before debating, then call crypto_finalize_decision."
+    ),
+)
+async def crypto_decide_tool(symbol: str, interval: str = "15m", leverage_cap: float = 20.0) -> str:
+    """Return the deterministic leverage-aware crypto :class:`TradeDecision` as JSON."""
+    decision = await engine_decide_crypto(
+        canonical_crypto(symbol), interval=interval, leverage_cap=leverage_cap
+    )
+    return _dumps(decision.to_dict())
+
+
+@mcp.tool(
+    name="crypto_evidence",
+    title="Gather full crypto evidence dossier",
+    description=(
+        "Fan out across the crypto capability server (multi-timeframe technicals, derivatives "
+        "funding/OI/long-short/basis, Fear & Greed, price factors) and return the combined dossier "
+        "plus the deterministic quant scoring. This is the raw material for the crypto debate."
+    ),
+)
+async def crypto_evidence_tool(symbol: str, interval: str = "15m") -> str:
+    """Return the crypto evidence dossier + quant scoring as JSON."""
+    sym = canonical_crypto(symbol)
+    dossier = await gather_crypto_evidence(sym, interval=interval)
+    scored = score_crypto_evidence(dossier)
+    return _dumps({"symbol": sym, "interval": interval, "dossier": dossier, "quant": scored})
+
+
+@mcp.tool(
+    name="derivatives",
+    title="Crypto derivatives (funding, OI, long/short, basis)",
+    description=(
+        "Funding rate (+ annualized), open interest and its short-window change, the long/short "
+        "account ratio, and the perpetual basis (mark vs index) for a crypto symbol. The core "
+        "microstructure read for a leveraged setup. `interval` sets the OI/long-short window."
+    ),
+)
+async def derivatives_tool(symbol: str, interval: str = "5m") -> str:
+    """Return the crypto derivatives snapshot as JSON."""
+    from .servers import crypto as cx
+
+    sym = canonical_crypto(symbol)
+    (deriv,) = await _safe_gather(cx.derivatives(sym, interval=interval))
+    return _dumps({"symbol": sym, "derivatives": deriv})
+
+
+@mcp.tool(
+    name="funding_rate",
+    title="Crypto funding rate",
+    description=(
+        "Current perpetual funding rate for a symbol, annualized, with mark/index price and the "
+        "basis. Positive funding = crowded longs paying shorts (contrarian-bearish at extremes)."
+    ),
+)
+async def funding_rate_tool(symbol: str) -> str:
+    """Return the current funding rate as JSON."""
+    from .providers import get_registry
+
+    sym = canonical_crypto(symbol)
+    try:
+        env = await get_registry().fetch("funding_rate", symbol=sym)
+        data = env.get("data") if isinstance(env, dict) else env
+    except Exception as exc:
+        data = {"_error": f"{type(exc).__name__}: {exc}"}
+    return _dumps({"symbol": sym, "funding": data})
+
+
+@mcp.tool(
+    name="crypto_technicals",
+    title="Crypto technical analysis (multi-timeframe)",
+    description=(
+        "Technical signals + latest indicators at the entry interval plus a 5m/15m/1h "
+        "multi-timeframe trend snapshot for a crypto symbol."
+    ),
+)
+async def crypto_technicals_tool(symbol: str, interval: str = "15m") -> str:
+    """Return crypto signals + indicators + multi-timeframe summary as JSON."""
+    from .servers import crypto as cx
+
+    sym = canonical_crypto(symbol)
+    signals, indicators, mtf = await _safe_gather(
+        cx.crypto_signals(sym, interval=interval),
+        cx.crypto_indicators(sym, interval=interval),
+        cx.multi_timeframe(sym),
+    )
+    return _dumps(
+        {"symbol": sym, "interval": interval, "signals": signals, "indicators": indicators, "multi_timeframe": mtf}
+    )
+
+
+@mcp.tool(
+    name="crypto_regime",
+    title="Crypto market regime (risk-on/off)",
+    description=(
+        "Trend + volatility regime on BTC (the crypto market beta): risk-on / caution / risk-off "
+        "and a 0..1 gross-exposure scalar, with a crypto-tuned volatility target and a Fear & Greed "
+        "extreme overlay. Scales how much leverage/exposure to take. AI-free, no API key."
+    ),
+)
+async def crypto_regime_tool() -> str:
+    """Return the crypto market regime + gross-exposure scalar as JSON."""
+    return _dumps(await run_crypto_regime())
+
+
+@mcp.tool(
+    name="crypto_screen",
+    title="Screen the crypto perp universe -> best longs & shorts",
+    description=(
+        "Screen the most-liquid USDT perpetuals in one call and return the best long and short "
+        "setups WITH how to trade each. Two-stage funnel: a cheap price-factor prefilter ranks the "
+        "universe, then the full crypto engine (derivatives + regime + leverage sizing) runs on the "
+        "strongest candidates. Returns top_longs/top_shorts as full leverage-aware TradeDecisions. "
+        "AI-free, no API key. `interval` = entry timeframe; `shortlist` = candidates deep-dived per "
+        "side; `top_n` = ideas surfaced per side."
+    ),
+)
+async def crypto_screen_tool(interval: str = "15m", shortlist: int = 10, top_n: int = 3) -> str:
+    """Return the crypto :class:`MarketScreen` as JSON."""
+    screen = await screen_crypto(interval=interval, shortlist=shortlist, top_n=top_n)
+    return _dumps(screen.to_dict())
+
+
+@mcp.tool(
+    name="crypto_finalize_decision",
+    title="Finalize the debated crypto decision",
+    description=(
+        "After the crypto bull/bear debate, record the judge's verdict here to produce the canonical "
+        "leverage-aware TradeDecision. The verdict's action/conviction/rationale override the quant "
+        "baseline while the deterministic scores, factors, regime, and the recomputed leverage plan "
+        "(liquidation price, suggested leverage, stop/target) are preserved. Always returns the "
+        "decision with the disclaimer."
+    ),
+)
+async def crypto_finalize_decision_tool(
+    symbol: str,
+    action: str,
+    interval: str = "15m",
+    leverage_cap: float = 20.0,
+    conviction: float | None = None,
+    horizon: str | None = None,
+    summary: str | None = None,
+    rationale: list[str] | None = None,
+    bull_case: list[str] | None = None,
+    bear_case: list[str] | None = None,
+    risks: list[str] | None = None,
+    invalidation: str | None = None,
+) -> str:
+    """Merge the host's debated crypto verdict with the quant backbone; return JSON."""
+    sym = canonical_crypto(symbol)
+    dossier = await gather_crypto_evidence(sym, interval=interval)
+    scored = score_crypto_evidence(dossier)
+    verdict: dict[str, Any] = {"action": action}
+    if conviction is not None:
+        verdict["conviction"] = conviction
+    if horizon:
+        verdict["horizon"] = horizon
+    if summary:
+        verdict["summary"] = summary
+    if rationale:
+        verdict["rationale"] = rationale
+    if bull_case:
+        verdict["bull_case"] = bull_case
+    if bear_case:
+        verdict["bear_case"] = bear_case
+    if risks:
+        verdict["risks"] = risks
+    if invalidation:
+        verdict["invalidation"] = invalidation
+    decision = decide_from_scores(sym, scored, verdict=verdict, method="debate")
+    decision = await enrich_crypto_decision(
+        decision, dossier, interval=interval, leverage_cap=leverage_cap
+    )
+    return _dumps(decision.to_dict())
+
+
 async def _safe_gather(*coros: Any) -> list[Any]:
     """Await coroutines concurrently; a failure becomes an ``{"_error": ...}`` dict."""
     import asyncio
@@ -478,6 +702,125 @@ def build_decide_sector_prompt(sector: str, top_n: int = 3) -> str:
     )
 
 
+def build_decide_market_prompt(top_n: int = 3) -> str:
+    """Build the whole-market screen + debate orchestration prompt for the host."""
+    return (
+        "You are running MakeCrazyPenny's whole-market screen of the S&P 500. "
+        f"Your goal is a shortlist: the {top_n} best long ideas and the {top_n} best "
+        "short ideas, each with a clear plan for HOW to trade it.\n\n"
+        "Follow these steps:\n"
+        f"1. SCREEN — Call the `screen_market` tool (top_n={top_n}). It ranks the whole "
+        "universe with a cheap price-factor prefilter, then runs the full quant engine "
+        "on the strongest candidates and returns `top_longs` and `top_shorts` as full "
+        "TradeDecisions (each already carries conviction, regime, position sizing, "
+        "stop/target and an invalidation level). Note the market regime it reports.\n"
+        f"2. DEBATE — For each of the {top_n} longs and {top_n} shorts, run a quick "
+        "bull-vs-bear check: call `gather_evidence` (or the per-domain tools) for the "
+        "name, argue the strongest honest case for and against, and decide whether the "
+        "quant ranking holds. Drop any idea whose case is weak on inspection; you may "
+        "also search the web for fresh catalysts.\n"
+        "3. SYNTHESIZE — Present the surviving longs and shorts. For EACH, give: the "
+        "ticker and direction, a one-line thesis, conviction, and the concrete plan "
+        "from its TradeDecision sizing (entry zone, stop, target, suggested size) plus "
+        "the invalidation that would flip the thesis. State the market regime and how "
+        "much gross exposure it argues for.\n"
+        "4. (Optional) For any single name you want the canonical decision object, call "
+        "`finalize_decision` with your debated verdict.\n\n"
+        "If you have a sub-agent / Task capability, fan the per-name debates out to "
+        "parallel sub-agents. Present the regime first, then the longs, then the shorts. "
+        "This is informational only and is NOT investment advice."
+    )
+
+
+def build_decide_crypto_prompt(symbol: str, interval: str = "15m", rounds: int = 2) -> str:
+    """Build the crypto bull-vs-bear orchestration prompt for the host's model."""
+    sym = canonical_crypto(symbol)
+    return (
+        f"You are running MakeCrazyPenny's autonomous LEVERAGED crypto trade-decision debate for "
+        f"{sym} on the {interval} timeframe. Your goal is a single decision: BUY (open a leveraged "
+        "long), SHORT (open a leveraged short), or AVOID (no position).\n\n"
+        "This is a very-short-window leveraged perpetual-futures trade, so weigh the derivatives "
+        "microstructure heavily and respect liquidation risk.\n\n"
+        "Follow these steps:\n"
+        f"1. EVIDENCE - Call `crypto_evidence` for {sym} (interval {interval}); it returns the full "
+        "dossier (multi-timeframe price action, funding, open interest, long/short ratio, basis, "
+        "Fear & Greed) plus a deterministic quant score. Drill in with `derivatives`, "
+        "`crypto_technicals`, or `funding_rate` as needed. Note the `crypto_regime`.\n"
+        "2. BULL - Build the strongest HONEST case to go long, citing concrete numbers.\n"
+        "3. BEAR - Build the strongest HONEST case to short or avoid, citing concrete numbers.\n"
+        "   Remember the contrarian reads: persistently positive funding and a crowded long/short "
+        "ratio and extreme greed all warn of a long squeeze (and vice-versa).\n"
+        f"4. REBUTTALS - Run {rounds} round(s) where each side answers the other's best points.\n"
+        "5. JUDGE - Weigh argument QUALITY and evidence strength (do NOT just average). Account for "
+        "the regime's gross-exposure scalar and for funding cost over the expected hold. Lean AVOID "
+        "when the edge is thin, the timeframes disagree, or funding makes the carry expensive.\n"
+        "6. FINALIZE - Call `crypto_finalize_decision` with your verdict (symbol, action, interval, "
+        "leverage_cap, conviction 0..1, horizon, summary, rationale, bull_case, bear_case, risks, "
+        "invalidation). It returns the canonical decision with the LEVERAGE PLAN: suggested "
+        "leverage, liquidation price, stop/target, margin %, and funding cost.\n\n"
+        "If you have a sub-agent / Task capability, spawn a 'bull-advocate' and a 'bear-advocate' "
+        "for steps 2-4 so the debate is genuinely adversarial.\n\n"
+        "Present the final decision, then the LEVERAGE PLAN (entry, suggested leverage, liquidation "
+        "price, stop, target, margin %, est. funding cost), then the bull case, the bear case, the "
+        "risks, and the invalidation. Stress that liquidation is an estimate and leverage amplifies "
+        "losses. This is informational only and is NOT investment advice."
+    )
+
+
+def build_bull_crypto_prompt(symbol: str, interval: str = "15m") -> str:
+    """Build the crypto bull-advocate persona prompt."""
+    sym = canonical_crypto(symbol)
+    return (
+        f"You are the BULL advocate for a leveraged LONG in {sym} ({interval}). First call "
+        f"`crypto_evidence` for {sym} (and `derivatives`/`crypto_technicals`/`funding_rate` as "
+        "needed). Cite specific numbers - momentum and trend alignment across timeframes, rising "
+        "open interest confirming the move, negative or neutral funding (cheap to hold longs), and "
+        "any oversold/fear extreme to fade. State a clear thesis, 3-6 evidence-tied key points, and "
+        "your honest conviction (0..1). Acknowledge liquidation/funding risk. Never fabricate - a "
+        "judge will check your claims. Informational only; NOT investment advice."
+    )
+
+
+def build_bear_crypto_prompt(symbol: str, interval: str = "15m") -> str:
+    """Build the crypto bear-advocate persona prompt."""
+    sym = canonical_crypto(symbol)
+    return (
+        f"You are the BEAR advocate for {sym} ({interval}) - argue to SHORT or AVOID. First call "
+        f"`crypto_evidence` for {sym} (and `derivatives`/`crypto_technicals`/`funding_rate` as "
+        "needed). Cite specific numbers - crowded positioning (high long/short ratio), persistently "
+        "positive funding (longs paying, squeeze risk), open interest rising into resistance, "
+        "extreme greed to fade, and bearish timeframe disagreement. State a clear thesis, 3-6 "
+        "evidence-tied key points, and your honest conviction (0..1). Never fabricate - a judge will "
+        "check your claims. Informational only; NOT investment advice."
+    )
+
+
+def build_decide_crypto_market_prompt(top_n: int = 3, interval: str = "15m") -> str:
+    """Build the crypto-universe screen + debate orchestration prompt for the host."""
+    return (
+        "You are running MakeCrazyPenny's screen of the most-liquid crypto perpetuals on the "
+        f"{interval} timeframe. Your goal is a shortlist: the {top_n} best long ideas and the "
+        f"{top_n} best short ideas, each with a leveraged plan.\n\n"
+        "Follow these steps:\n"
+        f"1. SCREEN - Call `crypto_screen` (interval={interval}, top_n={top_n}). It prefilters the "
+        "universe, runs the full quant engine on the strongest candidates, and returns `top_longs` "
+        "and `top_shorts` as full leverage-aware TradeDecisions (each already carries conviction, "
+        "regime, suggested leverage, liquidation price, stop/target). Note the crypto regime.\n"
+        f"2. DEBATE - For each of the {top_n} longs and {top_n} shorts, run a quick bull-vs-bear "
+        "check: call `crypto_evidence` (or `derivatives`) for the name, argue the strongest honest "
+        "case for and against, and decide whether the quant ranking holds. Drop weak ideas; respect "
+        "funding cost and liquidation risk.\n"
+        "3. SYNTHESIZE - Present the surviving longs and shorts. For EACH give: symbol and "
+        "direction, a one-line thesis, conviction, and the concrete leverage plan (entry, suggested "
+        "leverage, liquidation price, stop, target, margin %) plus the invalidation. State the "
+        "regime and how much gross exposure it argues for.\n"
+        "4. (Optional) For any single name, call `crypto_finalize_decision` with your verdict.\n\n"
+        "If you have a sub-agent / Task capability, fan the per-name debates out to parallel "
+        "sub-agents. Present the regime first, then longs, then shorts. Stress that leverage "
+        "amplifies losses and liquidation prices are estimates. Informational only; NOT advice."
+    )
+
+
 @mcp.prompt(
     name="decide",
     title="Decide: bull vs bear debate -> BUY/SHORT/AVOID",
@@ -522,6 +865,68 @@ def decide_sector_prompt(sector: str, top_n: str = "3") -> str:
     except (TypeError, ValueError):
         n = 3
     return build_decide_sector_prompt(sector, n)
+
+
+@mcp.prompt(
+    name="decide_market",
+    title="Screen the whole S&P 500 -> best longs & shorts",
+    description="Screen the whole S&P 500 and debate the best long/short ideas using the host's model.",
+)
+def decide_market_prompt(top_n: str = "3") -> str:
+    """MCP prompt: orchestrate a whole-market screen + per-name debate."""
+    try:
+        n = max(1, int(top_n))
+    except (TypeError, ValueError):
+        n = 3
+    return build_decide_market_prompt(n)
+
+
+@mcp.prompt(
+    name="decide_crypto",
+    title="Decide a crypto perp (leveraged) -> BUY/SHORT/AVOID",
+    description="Run the full leverage-aware bull/bear crypto debate for a symbol using the host's model.",
+)
+def decide_crypto_prompt(symbol: str, interval: str = "15m", rounds: str = "2") -> str:
+    """MCP prompt: the master leveraged-crypto debate orchestration for ``symbol``."""
+    try:
+        n = max(1, int(rounds))
+    except (TypeError, ValueError):
+        n = 2
+    return build_decide_crypto_prompt(symbol, interval or "15m", n)
+
+
+@mcp.prompt(
+    name="bull_case_crypto",
+    title="Crypto bull advocate",
+    description="Argue the strongest case for a leveraged long.",
+)
+def bull_crypto_prompt(symbol: str, interval: str = "15m") -> str:
+    """MCP prompt: the crypto bull-advocate persona for ``symbol``."""
+    return build_bull_crypto_prompt(symbol, interval or "15m")
+
+
+@mcp.prompt(
+    name="bear_case_crypto",
+    title="Crypto bear advocate",
+    description="Argue the strongest case to short or avoid a leveraged crypto position.",
+)
+def bear_crypto_prompt(symbol: str, interval: str = "15m") -> str:
+    """MCP prompt: the crypto bear-advocate persona for ``symbol``."""
+    return build_bear_crypto_prompt(symbol, interval or "15m")
+
+
+@mcp.prompt(
+    name="decide_crypto_market",
+    title="Screen crypto perps -> best leveraged longs & shorts",
+    description="Screen the crypto perp universe and debate the best long/short setups using the host's model.",
+)
+def decide_crypto_market_prompt(top_n: str = "3", interval: str = "15m") -> str:
+    """MCP prompt: orchestrate a crypto-universe screen + per-name debate."""
+    try:
+        n = max(1, int(top_n))
+    except (TypeError, ValueError):
+        n = 3
+    return build_decide_crypto_market_prompt(n, interval or "15m")
 
 
 # Keep a reference so linters see the config import is intentional (settings are

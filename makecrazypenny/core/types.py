@@ -342,6 +342,126 @@ class Filing:
 
 
 # ---------------------------------------------------------------------------
+# Crypto layer (see CONTRACT.md §16). Perpetual-futures derivatives metrics that
+# have no equity analogue: funding rate, open interest, long/short positioning,
+# and global market context. Plain value objects — no SDK, no I/O.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FundingRate:
+    """The current perpetual-swap funding rate for a symbol.
+
+    ``rate`` is the per-interval funding rate (e.g. ``0.0001`` = 1bp every
+    ``interval_hours``). Positive => longs pay shorts (crowded long).
+    """
+
+    symbol: str
+    rate: float
+    mark_price: float | None = None
+    index_price: float | None = None
+    next_funding_time: str | None = None
+    interval_hours: float = 8.0
+    provenance: Provenance | None = None
+
+    def annualized(self) -> float:
+        """Annualize the funding rate (``rate`` per interval -> per year)."""
+        per_day = (24.0 / self.interval_hours) if self.interval_hours else 3.0
+        return self.rate * per_day * 365.0
+
+    def basis(self) -> float | None:
+        """Mark-vs-index premium as a fraction (perp basis), or ``None``."""
+        if self.mark_price and self.index_price and self.index_price > 0:
+            return self.mark_price / self.index_price - 1.0
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "symbol": self.symbol,
+            "rate": self.rate,
+            "annualized": self.annualized(),
+            "mark_price": self.mark_price,
+            "index_price": self.index_price,
+            "basis": self.basis(),
+            "next_funding_time": self.next_funding_time,
+            "interval_hours": self.interval_hours,
+            "provenance": self.provenance.to_dict() if self.provenance else None,
+        }
+
+
+@dataclass
+class OpenInterest:
+    """Open interest (sum of outstanding contracts) for a perpetual symbol."""
+
+    symbol: str
+    open_interest: float
+    value: float | None = None  # notional value in quote currency (e.g. USDT)
+    ts: str | None = None
+    provenance: Provenance | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "symbol": self.symbol,
+            "open_interest": self.open_interest,
+            "value": self.value,
+            "ts": self.ts,
+            "provenance": self.provenance.to_dict() if self.provenance else None,
+        }
+
+
+@dataclass
+class LongShortRatio:
+    """The aggregate long/short account (or position) ratio for a symbol.
+
+    ``ratio`` is longs/shorts (>1 => more longs). ``long_pct``/``short_pct`` are
+    fractions in ``[0, 1]`` when the source provides them.
+    """
+
+    symbol: str
+    ratio: float | None = None
+    long_pct: float | None = None
+    short_pct: float | None = None
+    ts: str | None = None
+    provenance: Provenance | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "symbol": self.symbol,
+            "ratio": self.ratio,
+            "long_pct": self.long_pct,
+            "short_pct": self.short_pct,
+            "ts": self.ts,
+            "provenance": self.provenance.to_dict() if self.provenance else None,
+        }
+
+
+@dataclass
+class CryptoGlobal:
+    """Global crypto-market context (total cap, volume, BTC/ETH dominance)."""
+
+    total_market_cap: float | None = None
+    total_volume: float | None = None
+    btc_dominance: float | None = None
+    eth_dominance: float | None = None
+    market_cap_change_24h: float | None = None
+    provenance: Provenance | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "total_market_cap": self.total_market_cap,
+            "total_volume": self.total_volume,
+            "btc_dominance": self.btc_dominance,
+            "eth_dominance": self.eth_dominance,
+            "market_cap_change_24h": self.market_cap_change_24h,
+            "provenance": self.provenance.to_dict() if self.provenance else None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Decision layer (see CONTRACT.md §5.1, §10.3). The debate-driven decision
 # engine turns the read-only evidence dossier into an explicit, autonomous
 # trade decision. These are plain value objects too — no SDK, no I/O.
@@ -476,6 +596,11 @@ class TradeDecision:
     data_quality: dict[str, Any] = field(default_factory=dict)
     sizing: dict[str, Any] = field(default_factory=dict)
     regime: dict[str, Any] = field(default_factory=dict)
+    #: ``"equity"`` (default) or ``"crypto"`` — which engine produced this.
+    asset_class: str = "equity"
+    #: Leverage-aware plan (liquidation price, suggested leverage, funding cost,
+    #: notional/margin %). Empty for unlevered equity decisions (see §16).
+    leverage: dict[str, Any] = field(default_factory=dict)
     transcript: DebateTranscript | None = None
     note: str | None = None
     disclaimer: str = ""
@@ -503,6 +628,8 @@ class TradeDecision:
             "data_quality": dict(self.data_quality),
             "sizing": dict(self.sizing),
             "regime": dict(self.regime),
+            "asset_class": self.asset_class,
+            "leverage": dict(self.leverage),
             "transcript": self.transcript.to_dict() if self.transcript else None,
             "note": self.note,
             "disclaimer": self.disclaimer,
@@ -572,6 +699,73 @@ class SectorScan:
         }
 
 
+@dataclass
+class MarketScreen:
+    """A whole-universe screen funnelled down to the best trade ideas.
+
+    Produced by :func:`makecrazypenny.orchestration.screen.screen_market`: a cheap
+    price-factor **prefilter** ranks the entire universe (e.g. the S&P 500), the
+    strongest long and short candidates are shortlisted, and the full decision
+    engine is run only on those survivors. The result surfaces the best long and
+    short ideas — each a complete :class:`TradeDecision` (with sizing, stop/target,
+    regime, and invalidation) so the user sees not just *what* to trade but *how*.
+
+    Attributes:
+        universe: Label for the screened universe (e.g. ``"S&P 500"``).
+        universe_source: How the constituent list was obtained
+            (``"live"`` / ``"cache"`` / ``"fallback"``).
+        universe_count: How many constituents the universe held.
+        as_of: When the universe list was sourced (ISO-8601, or ``None``).
+        n_prefiltered: How many names produced a valid prefilter score.
+        n_evaluated: How many shortlisted names got a full decision.
+        regime: The market regime read (risk-on/off + gross-exposure scalar).
+        top_longs: The best BUY ideas, each a full ``TradeDecision`` dict.
+        top_shorts: The best SHORT ideas, each a full ``TradeDecision`` dict.
+        long_shortlist: Compact prefilter entries that fed the long deep-dive.
+        short_shortlist: Compact prefilter entries that fed the short deep-dive.
+        errors: ``{"symbol", "error"}`` for any name that failed (capped).
+        method: Decision method tag (``"quant"``).
+        summary: One-line human-readable verdict.
+        disclaimer: The not-investment-advice disclaimer (always present).
+    """
+
+    universe: str = "S&P 500"
+    universe_source: str = ""
+    universe_count: int = 0
+    as_of: str | None = None
+    n_prefiltered: int = 0
+    n_evaluated: int = 0
+    regime: dict[str, Any] = field(default_factory=dict)
+    top_longs: list[dict[str, Any]] = field(default_factory=list)
+    top_shorts: list[dict[str, Any]] = field(default_factory=list)
+    long_shortlist: list[dict[str, Any]] = field(default_factory=list)
+    short_shortlist: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    method: str = "quant"
+    summary: str = ""
+    disclaimer: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "universe": self.universe,
+            "universe_source": self.universe_source,
+            "universe_count": self.universe_count,
+            "as_of": self.as_of,
+            "n_prefiltered": self.n_prefiltered,
+            "n_evaluated": self.n_evaluated,
+            "regime": dict(self.regime),
+            "top_longs": [dict(r) for r in self.top_longs],
+            "top_shorts": [dict(r) for r in self.top_shorts],
+            "long_shortlist": [dict(r) for r in self.long_shortlist],
+            "short_shortlist": [dict(r) for r in self.short_shortlist],
+            "errors": [dict(e) for e in self.errors],
+            "method": self.method,
+            "summary": self.summary,
+            "disclaimer": self.disclaimer,
+        }
+
+
 def to_dict(obj: Any) -> Any:
     """Best-effort conversion of a core value object (or list thereof) to JSON.
 
@@ -603,10 +797,15 @@ __all__ = [
     "PriceTarget",
     "UpgradeDowngrade",
     "Filing",
+    "FundingRate",
+    "OpenInterest",
+    "LongShortRatio",
+    "CryptoGlobal",
     "DebateArgument",
     "DebateTranscript",
     "TradeDecision",
     "SectorScan",
+    "MarketScreen",
     "to_dict",
     "utcnow_iso",
 ]

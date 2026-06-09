@@ -24,12 +24,17 @@ import sys
 from typing import Any
 
 from ..analysis.backtest import backtest as run_backtest
+from ..analysis.crypto_regime import crypto_regime as run_crypto_regime
 from ..analysis.regime import market_regime as run_regime
 from ..core.disclaimer import with_disclaimer
+from ..core.symbols import canonical_crypto
 from ..servers._sdk import SDK_AVAILABLE, ClaudeSDKClient
 from .agents import build_options
+from .crypto import decide_crypto as run_crypto_decision
+from .crypto_screen import screen_crypto as run_crypto_screen
 from .debate import decide as run_decision
 from .market import scan_sector as run_sector_scan
+from .screen import screen_market as run_market_screen
 
 # Exit codes.
 EXIT_OK = 0
@@ -299,6 +304,230 @@ def _format_scan(s: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_screen(s: dict[str, Any]) -> str:
+    """Render a :class:`MarketScreen` dict as a readable ASCII CLI report."""
+    if s.get("errors") and s.get("n_evaluated", 0) == 0 and not (s.get("top_longs") or s.get("top_shorts")):
+        return f"Market screen failed: {s['errors'][0].get('error', 'unknown error')}"
+
+    src = s.get("universe_source", "?")
+    lines: list[str] = [
+        f"MARKET SCREEN: {s.get('universe', '?')}  ({s.get('universe_count', 0)} names, {src})",
+        s.get("summary", ""),
+        "",
+        (
+            f"Prefiltered: {s.get('n_prefiltered', 0)}   "
+            f"Deep-dived: {s.get('n_evaluated', 0)}"
+            + (f"   (as of {s.get('as_of')})" if s.get("as_of") else "")
+        ),
+    ]
+    regime = s.get("regime") or {}
+    if regime.get("regime"):
+        lines.append(
+            f"Market regime: {regime.get('regime')} (gross x{regime.get('gross_exposure', '?')})"
+        )
+
+    def _idea(d: dict[str, Any]) -> None:
+        sym = d.get("symbol", "?")
+        action = d.get("action", "?")
+        conv = float(d.get("conviction", 0.0))
+        lines.append("")
+        lines.append(
+            f"  {sym:<6} {action:<5} conv {conv:.0%}   "
+            f"net {d.get('net_score', 0):+.2f}   horizon {d.get('horizon', '?')}   "
+            f"size {d.get('suggested_sizing', '?')}"
+        )
+        if d.get("summary"):
+            lines.append(f"      {d['summary']}")
+        sizing = d.get("sizing") or {}
+        if sizing.get("position_pct") is not None:
+            plan = f"      Plan: ~{float(sizing.get('position_pct', 0)):.1%} of risk budget"
+            if sizing.get("stop_price"):
+                plan += (
+                    f"  ·  stop {sizing['stop_price']}  target {sizing.get('target_price')}"
+                    f"  ({sizing.get('r_multiple')}R)"
+                )
+            lines.append(plan)
+        if d.get("invalidation"):
+            lines.append(f"      Invalidation: {d['invalidation']}")
+
+    lines += ["", "TOP LONGS (go long):"]
+    longs = s.get("top_longs") or []
+    if not longs:
+        lines.append("  (none)")
+    else:
+        for d in longs:
+            _idea(d)
+
+    lines += ["", "TOP SHORTS (go short):"]
+    shorts = s.get("top_shorts") or []
+    if not shorts:
+        lines.append("  (none)")
+    else:
+        for d in shorts:
+            _idea(d)
+
+    if s.get("errors"):
+        lines += ["", f"Skipped {len(s['errors'])} name(s) on error."]
+
+    lines += [
+        "",
+        f"Method: {s.get('method', '?')}",
+        "Tip: for the full bull-vs-bear debate over these finalists (on your own "
+        "subscription), mount the MCP server (makecrazypenny-mcp) and run its "
+        "`decide_market` prompt.",
+    ]
+    return "\n".join(lines)
+
+
+def _pct(value: Any, places: int = 1) -> str:
+    """Format a fraction as a percentage, tolerating ``None``."""
+    try:
+        return f"{float(value):.{places}%}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_crypto_decision(d: dict[str, Any]) -> str:
+    """Render a leverage-aware crypto :class:`TradeDecision` dict as an ASCII report."""
+    action = d.get("action", "?")
+    direction = d.get("direction", "?")
+    conviction = d.get("conviction", 0.0)
+    sym = d.get("symbol", "?")
+    lev = d.get("leverage") or {}
+
+    lines: list[str] = [
+        f"CRYPTO DECISION for {sym}:  {action}  ({direction})",
+        f"Conviction: {float(conviction):.0%}   Horizon: {d.get('horizon', '?')}   "
+        f"Size: {d.get('suggested_sizing', '?')}",
+        "",
+        d.get("summary", ""),
+        "",
+        "Why:",
+        _bullets(d.get("rationale")),
+        "",
+        "Bull case (for a leveraged long):",
+        _bullets(d.get("bull_case")),
+        "",
+        "Bear case (against / for shorting):",
+        _bullets(d.get("bear_case")),
+        "",
+        "Risks:",
+        _bullets(d.get("risks")),
+    ]
+
+    if lev.get("direction") in ("LONG", "SHORT"):
+        lines += [
+            "",
+            "LEVERAGE PLAN (informational; liquidation is an estimate):",
+            f"  Entry ~ {lev.get('entry_price')}   Suggested leverage: {lev.get('suggested_leverage')}x "
+            f"(max safe {lev.get('max_safe_leverage')}x)",
+            f"  Liquidation ~ {lev.get('liquidation_price')}   Stop {lev.get('stop_price')}   "
+            f"Target {lev.get('target_price')}  ({lev.get('r_multiple')}R)",
+            f"  Margin ~{_pct(lev.get('margin_pct'))} of equity   Risk/trade ~{_pct(lev.get('risk_per_trade_pct'))}   "
+            f"Notional ~{_pct(lev.get('notional_pct'), 0)}   Est. funding cost ~{_pct(lev.get('est_funding_cost_pct'), 2)}",
+        ]
+    elif action == "AVOID":
+        lines += ["", "LEVERAGE PLAN: none (AVOID - no position)."]
+
+    if d.get("invalidation"):
+        lines += ["", f"Invalidation (what would flip this): {d['invalidation']}"]
+
+    lines += [
+        "",
+        (
+            f"Quant backbone: net {d.get('net_score', 0):+.2f} "
+            f"(bull {d.get('bull_score', 0):.2f} / bear {d.get('bear_score', 0):.2f}) "
+            f"across {d.get('data_quality', {}).get('n_factors', 0)} factors"
+        ),
+    ]
+    for f in sorted(d.get("factors") or [], key=lambda f: -abs(f.get("contribution", 0)))[:7]:
+        lines.append(
+            f"  [{f.get('side', '?'):>4}] {f.get('detail', f.get('name', '?'))} "
+            f"({f.get('contribution', 0):+.2f})"
+        )
+
+    regime = d.get("regime") or {}
+    if regime.get("regime"):
+        extra = ""
+        if regime.get("above_trend") is not None:
+            extra = f", BTC {'above' if regime.get('above_trend') else 'below'} trend"
+        lines += ["", f"Crypto regime: {regime.get('regime')} (gross x{regime.get('gross_exposure', '?')}{extra})"]
+
+    lines += [
+        "",
+        f"Method: {d.get('method', '?')}",
+    ]
+    if d.get("method", "").startswith("quant"):
+        lines.append(
+            "Tip: this is the deterministic quant baseline. For the full bull-vs-bear AI "
+            "debate (run on your own subscription), mount the MCP server (makecrazypenny-mcp) "
+            "and run its `decide_crypto` prompt."
+        )
+    return "\n".join(lines)
+
+
+def _format_crypto_screen(s: dict[str, Any]) -> str:
+    """Render a crypto :class:`MarketScreen` dict as an ASCII report (with leverage)."""
+    if s.get("errors") and s.get("n_evaluated", 0) == 0 and not (s.get("top_longs") or s.get("top_shorts")):
+        return f"Crypto screen failed: {s['errors'][0].get('error', 'unknown error')}"
+
+    src = s.get("universe_source", "?")
+    lines: list[str] = [
+        f"CRYPTO SCREEN: {s.get('universe', '?')}  ({s.get('universe_count', 0)} perps, {src})",
+        s.get("summary", ""),
+        "",
+        f"Prefiltered: {s.get('n_prefiltered', 0)}   Deep-dived: {s.get('n_evaluated', 0)}",
+    ]
+    regime = s.get("regime") or {}
+    if regime.get("regime"):
+        lines.append(f"Crypto regime: {regime.get('regime')} (gross x{regime.get('gross_exposure', '?')})")
+
+    def _idea(d: dict[str, Any]) -> None:
+        lev = d.get("leverage") or {}
+        lines.append("")
+        lines.append(
+            f"  {d.get('symbol', '?'):<12} {d.get('action', '?'):<5} conv {float(d.get('conviction', 0)):.0%}   "
+            f"net {d.get('net_score', 0):+.2f}   {d.get('horizon', '?')}"
+        )
+        if d.get("summary"):
+            lines.append(f"      {d['summary']}")
+        if lev.get("direction") in ("LONG", "SHORT"):
+            lines.append(
+                f"      Plan: {lev.get('suggested_leverage')}x  entry ~{lev.get('entry_price')}  "
+                f"liq ~{lev.get('liquidation_price')}  stop {lev.get('stop_price')}  "
+                f"target {lev.get('target_price')}  margin ~{_pct(lev.get('margin_pct'))}"
+            )
+        if d.get("invalidation"):
+            lines.append(f"      Invalidation: {d['invalidation']}")
+
+    lines += ["", "TOP LONGS (leveraged long):"]
+    longs = s.get("top_longs") or []
+    if not longs:
+        lines.append("  (none)")
+    else:
+        for d in longs:
+            _idea(d)
+
+    lines += ["", "TOP SHORTS (leveraged short):"]
+    shorts = s.get("top_shorts") or []
+    if not shorts:
+        lines.append("  (none)")
+    else:
+        for d in shorts:
+            _idea(d)
+
+    if s.get("errors"):
+        lines += ["", f"Skipped {len(s['errors'])} name(s) on error."]
+
+    lines += [
+        "",
+        f"Method: {s.get('method', '?')}",
+        "Tip: for the full bull-vs-bear debate over these finalists (on your own subscription), "
+        "mount the MCP server (makecrazypenny-mcp) and run its `decide_crypto_market` prompt.",
+    ]
+    return "\n".join(lines)
+
+
 def _format_regime(r: dict[str, Any]) -> str:
     """Render the market-regime dict as an ASCII line block."""
     lines = [
@@ -307,8 +536,12 @@ def _format_regime(r: dict[str, Any]) -> str:
     ]
     if r.get("above_200dma") is not None:
         lines.append(f"  Above 200DMA: {r.get('above_200dma')}   12-1 momentum: {r.get('ts_momentum')}")
+    if r.get("above_trend") is not None:
+        lines.append(f"  Above trend: {r.get('above_trend')}   momentum: {r.get('ts_momentum')}")
     if r.get("realized_vol") is not None:
         lines.append(f"  Realized vol: {float(r['realized_vol']):.0%}   vol scale: x{r.get('vol_scale')}")
+    if r.get("fng_value") is not None:
+        lines.append(f"  Fear & Greed: {r.get('fng_value')}/100   F&G scale: x{r.get('fng_scale', 1.0)}")
     if r.get("_error"):
         lines.append(f"  (data issue: {r['_error']})")
     return "\n".join(lines)
@@ -349,10 +582,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="makecrazypenny",
         description=(
-            "Run MakeCrazyPenny over a single stock or a whole sector. With a SYMBOL "
-            "(decide mode, default) it prints a BUY/SHORT/AVOID quant decision. With "
-            "--sector it scans every constituent and prints a sector stance + ranked "
-            "long/short ideas. Informational only; NOT investment advice."
+            "Run MakeCrazyPenny over a single stock, a whole sector, the whole S&P 500, "
+            "or crypto. With a SYMBOL (decide mode, default) it prints a BUY/SHORT/AVOID "
+            "quant decision. With --sector it scans every constituent. With --market it "
+            "screens the whole S&P 500. With --crypto SYMBOL it makes a leverage-aware "
+            "perpetual-futures decision (suggested leverage, liquidation price, stop/target); "
+            "--crypto-market screens the crypto perp universe. Informational only; NOT "
+            "investment advice."
         ),
     )
     parser.add_argument(
@@ -377,13 +613,63 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--top",
         type=int,
-        default=5,
-        help="Sector mode: how many long/short ideas to surface (default: 5).",
+        default=None,
+        help="How many long/short ideas to surface (default: sector 5, market 3).",
+    )
+    parser.add_argument(
+        "--market",
+        action="store_true",
+        help=(
+            "Screen the whole S&P 500 (live-fetched) and print the best long/short "
+            "ideas with how to trade each. Uses --top for ideas per side and "
+            "--shortlist for candidates deep-dived per side."
+        ),
+    )
+    parser.add_argument(
+        "--shortlist",
+        type=int,
+        default=15,
+        help="Market mode: candidates deep-dived per side after the prefilter (default: 15).",
     )
     parser.add_argument(
         "--regime",
         action="store_true",
         help="Print the market regime (risk-on/off + gross-exposure scalar) and exit.",
+    )
+    parser.add_argument(
+        "--crypto",
+        metavar="SYMBOL",
+        default=None,
+        help=(
+            "Decide a crypto perpetual (e.g. BTC, BTCUSDT, ETH/USDT) with a leverage-aware "
+            "plan: action, suggested leverage, liquidation price, stop/target. Use --interval "
+            "and --leverage to tune."
+        ),
+    )
+    parser.add_argument(
+        "--crypto-market",
+        action="store_true",
+        help=(
+            "Screen the most-liquid crypto perpetuals and print the best leveraged long/short "
+            "setups. Uses --interval, --top, and --shortlist."
+        ),
+    )
+    parser.add_argument(
+        "--crypto-regime",
+        action="store_true",
+        help="Print the crypto market regime (BTC trend + vol + Fear & Greed) and exit.",
+    )
+    parser.add_argument(
+        "--interval",
+        metavar="TF",
+        default="15m",
+        help="Crypto entry timeframe (e.g. 1m, 5m, 15m, 1h; default: 15m).",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=None,
+        help="Crypto: cap on suggested leverage (default: from settings, 20x).",
     )
     parser.add_argument(
         "--backtest",
@@ -418,7 +704,65 @@ def cli(argv: list[str] | None = None) -> int:
     Returns:
         ``0`` on success; ``2`` if the SDK is missing; ``3`` on a runtime error.
     """
+    # Reports contain Unicode (·, etc.); ensure they render on consoles whose
+    # default code page is not UTF-8 (notably Windows cp1252/cp437).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
     args = _parse_args(argv)
+
+    # --- Crypto regime (no symbol needed) ------------------------------------
+    if args.crypto_regime:
+        try:
+            regime = asyncio.run(run_crypto_regime())
+            output = _format_regime(regime)
+        except Exception as exc:
+            print(f"Error: the crypto regime check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    # --- Crypto market screen (no symbol needed) -----------------------------
+    if args.crypto_market:
+        top_n = args.top if args.top is not None else 3
+        try:
+            screen = asyncio.run(
+                run_crypto_screen(
+                    interval=args.interval,
+                    shortlist=args.shortlist,
+                    top_n=top_n,
+                    leverage_cap=args.leverage,
+                )
+            )
+            output = _format_crypto_screen(screen.to_dict())
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        except Exception as exc:
+            print(f"Error: the crypto screen failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    # --- Crypto single-symbol decide -----------------------------------------
+    if args.crypto:
+        sym = canonical_crypto(args.crypto)
+        try:
+            decision = asyncio.run(
+                run_crypto_decision(sym, interval=args.interval, leverage_cap=args.leverage)
+            )
+            output = _format_crypto_decision(decision.to_dict())
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        except Exception as exc:
+            print(f"Error: the crypto decision failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
 
     # --- Market regime (no symbol needed) ------------------------------------
     if args.regime:
@@ -446,10 +790,31 @@ def cli(argv: list[str] | None = None) -> int:
         print(with_disclaimer(output))
         return EXIT_OK
 
+    # --- Market mode: screen the whole S&P 500 (deterministic, AI-free, no key) ---
+    if args.market:
+        top_n = args.top if args.top is not None else 3
+        try:
+            screen = asyncio.run(run_market_screen(shortlist=args.shortlist, top_n=top_n))
+            output = _format_screen(screen.to_dict())
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        except Exception as exc:  # surface cleanly, no traceback
+            print(f"Error: the market screen failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
     # --- Sector mode: scan a whole sector (deterministic, AI-free, no key) ----
     if args.sector:
         try:
-            scan = asyncio.run(run_sector_scan(args.sector, limit=args.limit or None, top_n=args.top))
+            scan = asyncio.run(
+                run_sector_scan(
+                    args.sector,
+                    limit=args.limit or None,
+                    top_n=args.top if args.top is not None else 5,
+                )
+            )
             output = _format_scan(scan.to_dict())
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
