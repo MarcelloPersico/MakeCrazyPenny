@@ -79,9 +79,14 @@ async def build_portfolio(
     """Build a regime-scaled, conviction x inverse-vol portfolio from ``symbols``.
 
     Returns a dict with ``longs``/``shorts`` (each ``{symbol, weight, conviction,
-    ...}``), ``gross_exposure``/``net_exposure``, the ``regime``, ``errors``, and the
-    disclaimer. Weights within each side sum to 1 *before* the gross-exposure scale;
-    ``weight x gross_exposure`` is the suggested capital fraction.
+    ...}``), exposure figures, the ``regime``, ``errors``, and the disclaimer.
+
+    Exposure semantics: weights within each side sum to 1 before scaling, so
+    ``weight x gross_exposure`` is that name's suggested capital fraction
+    *within its side*. ``long_exposure``/``short_exposure`` are each side's
+    scaled total; ``total_gross_exposure`` is their sum (a populated long/short
+    book is gross long + gross short, i.e. up to 2x the per-side scalar) and
+    ``net_exposure`` their difference.
     """
     settings = settings or Settings.from_env()
     syms = [normalize_symbol(s) for s in symbols if str(s).strip()]
@@ -114,8 +119,15 @@ async def build_portfolio(
     rows = [p for tag, p in results if tag == "ok"]
     errors = [p for tag, p in results if tag == "err"]
 
-    longs_in = sorted([r for r in rows if r["action"] == "BUY"], key=lambda r: -r["conviction"])[:max_positions]
-    shorts_in = sorted([r for r in rows if r["action"] == "SHORT"], key=lambda r: r["net_score"])[:max_positions]
+    # Both sides ranked the same way: conviction first, score magnitude second.
+    longs_in = sorted(
+        [r for r in rows if r["action"] == "BUY"],
+        key=lambda r: (-r["conviction"], -r["net_score"]),
+    )[:max_positions]
+    shorts_in = sorted(
+        [r for r in rows if r["action"] == "SHORT"],
+        key=lambda r: (-r["conviction"], r["net_score"]),
+    )[:max_positions]
     longs = _weight_side(longs_in, max_weight)
     shorts = _weight_side(shorts_in, max_weight)
 
@@ -130,6 +142,7 @@ async def build_portfolio(
         "shorts": shorts,
         "long_exposure": long_gross,
         "short_exposure": short_gross,
+        "total_gross_exposure": round(long_gross + short_gross, 4),
         "net_exposure": round(long_gross - short_gross, 4),
         "errors": errors,
         "method": "quant",

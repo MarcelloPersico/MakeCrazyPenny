@@ -82,26 +82,26 @@ class TTLCache:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self._cache_dir / f"{digest}.json"
 
-    def _l2_read(self, key: str) -> tuple[bool, Any]:
+    def _l2_read(self, key: str) -> tuple[bool, Any, float]:
         """Read a fresh value from L2.
 
         Returns:
-            ``(hit, value)`` where ``hit`` is ``True`` only for a fresh entry.
-            Any error or staleness yields ``(False, None)``.
+            ``(hit, value, expires_at)`` where ``hit`` is ``True`` only for a
+            fresh entry. Any error or staleness yields ``(False, None, 0.0)``.
         """
         if not self._l2_enabled:
-            return False, None
+            return False, None, 0.0
         path = self._l2_path(key)
         try:
             with path.open("r", encoding="utf-8") as fh:
                 record = json.load(fh)
             expires_at = float(record["expires_at"])
             if expires_at <= time.time():
-                return False, None
-            return True, record["value"]
+                return False, None, 0.0
+            return True, record["value"], expires_at
         except (OSError, ValueError, KeyError, TypeError):
             # Missing, corrupt, or unreadable: silently miss.
-            return False, None
+            return False, None, 0.0
 
     def _l2_write(self, key: str, value: Any, expires_at: float) -> None:
         """Mirror a value to L2, swallowing any disk error."""
@@ -134,11 +134,11 @@ class TTLCache:
             # Expired L1 entry; drop it.
             self._l1.pop(key, None)
 
-        hit, value = self._l2_read(key)
+        hit, value, expires_at = self._l2_read(key)
         if hit:
-            # Promote to L1 using L2's expiry is unknown here; re-read expiry.
-            # Simplest correct behavior: trust freshness and cache briefly via
-            # the L2 record's own expiry, which _l2_read already validated.
+            # Promote into L1 with L2's own (validated) expiry, so subsequent
+            # lookups stop paying the disk read.
+            self._l1[key] = (expires_at, value)
             return True, value
         return False, None
 

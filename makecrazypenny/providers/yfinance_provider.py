@@ -189,7 +189,10 @@ class YFinanceProvider(Provider):
         import yfinance as yf  # noqa: PLC0415 (lazy import is intentional)
 
         ticker = yf.Ticker(symbol)
-        frame = ticker.history(period=period, interval=interval, auto_adjust=False)
+        # auto_adjust=True: split/dividend-adjusted prices. The factor lookbacks
+        # (12-1 momentum, 200-DMA, 52w high) and the backtest consume these bars;
+        # unadjusted closes would turn every split into a fake crash.
+        frame = ticker.history(period=period, interval=interval, auto_adjust=True)
 
         bars: list[OHLCVBar] = []
         if frame is None or getattr(frame, "empty", True):

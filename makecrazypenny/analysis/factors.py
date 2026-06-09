@@ -71,8 +71,15 @@ def trend_vs_sma(closes: list[float], window: int = _SMA_WINDOW) -> float | None
     return closes[-1] / sma - 1.0
 
 
-def realized_vol(closes: list[float], window: int = _VOL_WINDOW) -> float | None:
-    """Annualized realized volatility from daily log returns over ``window`` days."""
+def realized_vol(
+    closes: list[float], window: int = _VOL_WINDOW, *, periods_per_year: float = _YEAR
+) -> float | None:
+    """Annualized realized volatility from per-bar log returns over ``window`` bars.
+
+    ``periods_per_year`` sets the annualization factor: 252 for equity daily bars
+    (the default), 365 for crypto daily bars (crypto trades every day), and
+    ``365 * 1440 / interval_minutes`` for intraday crypto bars.
+    """
     series = closes[-(window + 1):]
     if len(series) < 20:
         return None
@@ -82,7 +89,7 @@ def realized_vol(closes: list[float], window: int = _VOL_WINDOW) -> float | None
         return None
     mean = sum(rets) / n
     var = sum((r - mean) ** 2 for r in rets) / (n - 1)
-    return math.sqrt(var) * math.sqrt(_YEAR)
+    return math.sqrt(var) * math.sqrt(max(periods_per_year, 1.0))
 
 
 def _unwrap_fundamentals(fundamentals: Any) -> dict[str, Any]:
@@ -120,7 +127,7 @@ def value_quality(fundamentals: Any) -> dict[str, float]:
     Defensive: reads common yfinance ``.info`` / provider keys and returns only
     the factors it can compute. Yields (when available):
     ``earnings_yield``, ``book_to_price``, ``fcf_yield`` (value) and
-    ``gross_profitability``/``roe``/``profit_margin`` (quality).
+    ``gross_margin``/``roe``/``profit_margin`` (quality).
     """
     info = _unwrap_fundamentals(fundamentals)
     if not info:
@@ -138,9 +145,11 @@ def value_quality(fundamentals: Any) -> dict[str, float]:
     if fcf is not None and mcap and mcap > 0:
         out["fcf_yield"] = fcf / mcap
 
+    # Note: this is gross *margin* (gross profit / revenue), the closest free
+    # proxy available — NOT Novy-Marx gross profitability (GP / total assets).
     gm = _num(info, "grossMargins", "gross_margin", "gross_profitability")
     if gm is not None:
-        out["gross_profitability"] = gm
+        out["gross_margin"] = gm
     roe = _num(info, "returnOnEquity", "roe")
     if roe is not None:
         out["roe"] = roe
@@ -151,13 +160,21 @@ def value_quality(fundamentals: Any) -> dict[str, float]:
 
 
 def factor_values(
-    bars: list[dict[str, Any]], fundamentals: Any = None
+    bars: list[dict[str, Any]],
+    fundamentals: Any = None,
+    *,
+    periods_per_year: float = _YEAR,
 ) -> dict[str, Any]:
     """Compute all available factor values from ``bars`` (+ optional fundamentals).
 
     Pure function. Returns a dict with whichever of ``momentum_12_1``,
     ``pct_52w_high``, ``trend_200``, ``realized_vol`` (from price) and the
     value/quality factors (from fundamentals) could be computed, plus ``n_bars``.
+
+    ``periods_per_year`` controls the vol annualization (252 for equity daily
+    bars; crypto callers pass the bar frequency). On non-daily bars the momentum/
+    trend/high lookbacks become *bar-based* windows — the caller must score them
+    against interval-appropriate saturations (see ``orchestration/crypto.py``).
     """
     closes = _floats(bars, "close")
     highs = _floats(bars, "high") or closes
@@ -177,7 +194,7 @@ def factor_values(
     trend = trend_vs_sma(closes)
     if trend is not None:
         values["trend_200"] = round(trend, 6)
-    vol = realized_vol(closes)
+    vol = realized_vol(closes, periods_per_year=periods_per_year)
     if vol is not None:
         values["realized_vol"] = round(vol, 6)
 

@@ -129,8 +129,9 @@ class AlphaVantageProvider(Provider):
         """Normalize a ``TIME_SERIES_*`` response into :class:`OHLCV`."""
         symbol = _require_symbol(params)
         interval = str(params.get("interval", "1d"))
+        period = str(params.get("period", ""))
 
-        query, series_key_prefix = _ohlcv_query(symbol, interval)
+        query, series_key_prefix = _ohlcv_query(symbol, interval, period)
         data = await self._request(api_key, query)
 
         series = _extract_time_series(data, series_key_prefix)
@@ -252,14 +253,41 @@ def _require_symbol(params: dict[str, Any]) -> str:
     return str(symbol).strip().upper()
 
 
-def _ohlcv_query(symbol: str, interval: str) -> tuple[dict[str, Any], str]:
+def _needs_full_output(period: str) -> bool:
+    """Whether the requested look-back exceeds AV's 100-point ``compact`` window.
+
+    ``compact`` returns only the latest 100 daily bars, silently starving the
+    12-1 momentum (253 bars) and 200-DMA factors when AV serves the chain. Any
+    period of a year or longer (``1y``, ``2y``, ``10y``, ``max``) needs ``full``.
+    """
+    p = period.strip().lower()
+    if not p:
+        return False
+    if p == "max" or p.endswith("y"):
+        return True
+    # Month-denominated periods: >4 months of trading days exceeds 100 bars.
+    if p.endswith("mo"):
+        try:
+            return int(p[:-2]) > 4
+        except ValueError:
+            return False
+    return False
+
+
+def _ohlcv_query(symbol: str, interval: str, period: str = "") -> tuple[dict[str, Any], str]:
     """Map an interval to the Alpha Vantage function + the time-series key prefix.
 
     Returns a ``(query, key_prefix)`` tuple. ``key_prefix`` is matched against the
     response keys to locate the bar dictionary (Alpha Vantage names that key
-    differently per function, e.g. ``"Time Series (Daily)"``).
+    differently per function, e.g. ``"Time Series (Daily)"``). ``period`` selects
+    ``outputsize`` (``full`` for >100-bar look-backs).
+
+    Note: the daily series is split/dividend-UNadjusted (the adjusted endpoint is
+    premium-only). yfinance, which serves adjusted bars, is ahead of AV in the
+    default ``ohlcv`` chain; AV is a degraded fallback.
     """
     iv = interval.strip().lower()
+    outputsize = "full" if _needs_full_output(period) else "compact"
 
     if iv in _INTRADAY_INTERVALS:
         return (
@@ -267,7 +295,7 @@ def _ohlcv_query(symbol: str, interval: str) -> tuple[dict[str, Any], str]:
                 "function": "TIME_SERIES_INTRADAY",
                 "symbol": symbol,
                 "interval": iv,
-                "outputsize": "compact",
+                "outputsize": outputsize,
             },
             "Time Series (",
         )
@@ -278,7 +306,7 @@ def _ohlcv_query(symbol: str, interval: str) -> tuple[dict[str, Any], str]:
 
     # Default: daily bars (covers "1d", "1day", "daily", and anything unknown).
     return (
-        {"function": "TIME_SERIES_DAILY", "symbol": symbol, "outputsize": "compact"},
+        {"function": "TIME_SERIES_DAILY", "symbol": symbol, "outputsize": outputsize},
         "Time Series (Daily)",
     )
 

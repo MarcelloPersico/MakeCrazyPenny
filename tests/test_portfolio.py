@@ -79,6 +79,9 @@ async def test_build_portfolio_regime_scales_exposure(monkeypatch: pytest.Monkey
     assert result["gross_exposure"] == 0.3
     # weights sum to 1 pre-scale; long_exposure = gross x sum(weights) = 0.3
     assert abs(result["long_exposure"] - 0.3) < 1e-3
+    # Long-only book: total gross == long side; net == long - short.
+    assert abs(result["total_gross_exposure"] - 0.3) < 1e-3
+    assert abs(result["net_exposure"] - 0.3) < 1e-3
 
 
 async def test_build_sector_portfolio_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

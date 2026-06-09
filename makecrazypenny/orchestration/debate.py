@@ -55,13 +55,20 @@ _DEFAULT_SIGNAL_WEIGHT = 1.0
 _SENTIMENT_WEIGHT = 2.0
 #: Weight applied to the analyst-consensus tilt (computed into [-1, 1]).
 _CONSENSUS_WEIGHT = 2.0
+#: Sell-side ratings skew structurally bullish (buys outnumber sells ~5:1), so
+#: an *average* stock carries a tilt of roughly +0.3. Score the tilt relative to
+#: that baseline so "ordinary optimism" reads as neutral, not as a buy signal.
+_CONSENSUS_BASELINE = 0.30
 #: Weight applied to price-target upside (saturates at ±_UPSIDE_SATURATION).
 _PRICE_TARGET_WEIGHT = 1.5
-_UPSIDE_SATURATION = 0.20  # ±20% upside -> full weight
+_UPSIDE_SATURATION = 0.20  # ±20% upside beyond the baseline -> full weight
+#: Mean analyst targets sit persistently ~10%+ above spot; de-mean the upside so
+#: the routine optimism premium does not register as a structural long signal.
+_TARGET_UPSIDE_BASELINE = 0.10
 #: Weight applied to disclosed congressional / insider net buying.
 _CONGRESS_WEIGHT = 1.0
 _INSIDER_WEIGHT = 1.0
-_FLOW_SATURATION = 3  # net of 3+ trades -> full weight
+_FLOW_SATURATION = 3.0  # dollar-weighted net of 3+ -> full weight
 
 #: Factor weights (research-backed; see plan.md §10). Folded into the same
 #: weighted-factor scoring as the other evidence.
@@ -251,10 +258,17 @@ def _score_ratings(dossier: dict[str, Any], factors: list[dict[str, Any]]) -> No
     tilt = _consensus_tilt(rating)
     if tilt is None:
         return
-    contribution = _clamp(tilt, -1.0, 1.0) * _CONSENSUS_WEIGHT
+    # De-mean against the structural buy-side skew of sell-side ratings.
+    excess = tilt - _CONSENSUS_BASELINE
+    contribution = _clamp(excess, -1.0, 1.0) * _CONSENSUS_WEIGHT
     if abs(contribution) > 1e-9:
         factors.append(
-            _factor("analyst", "consensus", contribution, f"consensus tilt {tilt:+.2f}")
+            _factor(
+                "analyst",
+                "consensus",
+                contribution,
+                f"consensus tilt {tilt:+.2f} (vs +{_CONSENSUS_BASELINE:.2f} baseline)",
+            )
         )
 
 
@@ -273,10 +287,17 @@ def _score_price_target(dossier: dict[str, Any], factors: list[dict[str, Any]]) 
     if mean is None or current is None or current <= 0:
         return
     upside = (mean - current) / current
-    contribution = _clamp(upside / _UPSIDE_SATURATION, -1.0, 1.0) * _PRICE_TARGET_WEIGHT
+    # De-mean against the persistent optimism premium in mean targets.
+    excess = upside - _TARGET_UPSIDE_BASELINE
+    contribution = _clamp(excess / _UPSIDE_SATURATION, -1.0, 1.0) * _PRICE_TARGET_WEIGHT
     if abs(contribution) > 1e-9:
         factors.append(
-            _factor("price_target", "target_upside", contribution, f"target upside {upside:+.1%}")
+            _factor(
+                "price_target",
+                "target_upside",
+                contribution,
+                f"target upside {upside:+.1%} (vs +{_TARGET_UPSIDE_BASELINE:.0%} baseline)",
+            )
         )
 
 
@@ -290,6 +311,46 @@ def _classify_flow(transaction: Any) -> int:
     return 0
 
 
+def _flow_dollars(row: dict[str, Any]) -> float | None:
+    """Best-effort dollar size of a disclosed trade.
+
+    Insider rows carry a numeric ``value``; congressional rows carry a range
+    string like ``"$1,001 - $15,000"`` (the midpoint is used). ``None`` when no
+    size can be recovered.
+    """
+    val = _as_float(row.get("value"))
+    if val is not None and val > 0:
+        return val
+    rng = str(row.get("amount_range") or "")
+    nums: list[float] = []
+    for part in rng.replace(",", "").replace("$", " ").split():
+        f = _as_float(part)
+        if f is not None and f > 0:
+            nums.append(f)
+    if nums:
+        return sum(nums[:2]) / len(nums[:2])
+    return None
+
+
+def _flow_size_weight(row: dict[str, Any]) -> float:
+    """Map a trade's dollar size to a 0.5..2.0 multiplier (1.0 when unknown).
+
+    A $1k-15k congressional disclosure should not move the score as much as a
+    $1M+ insider purchase. Buckets (midpoint dollars): <$50k -> 0.5,
+    $50k-$250k -> 1.0, $250k-$1M -> 1.5, >$1M -> 2.0.
+    """
+    dollars = _flow_dollars(row)
+    if dollars is None:
+        return 1.0
+    if dollars < 50_000:
+        return 0.5
+    if dollars < 250_000:
+        return 1.0
+    if dollars < 1_000_000:
+        return 1.5
+    return 2.0
+
+
 def _score_flow(
     dossier: dict[str, Any],
     key: str,
@@ -298,23 +359,34 @@ def _score_flow(
     weight: float,
     factors: list[dict[str, Any]],
 ) -> None:
-    """Score net buying from a list of disclosed trades/transactions."""
+    """Score size-weighted net buying from a list of disclosed trades."""
     block = dossier.get(key)
     if not isinstance(block, dict):
         return
     rows = block.get(rows_key)
     if not isinstance(rows, list) or not rows:
         return
-    net = 0
+    net = 0.0
+    count = 0
     for row in rows:
         if isinstance(row, dict):
-            net += _classify_flow(row.get("transaction"))
-    if net == 0:
+            side = _classify_flow(row.get("transaction"))
+            if side:
+                net += side * _flow_size_weight(row)
+                count += 1
+    if abs(net) < 1e-9:
         return
     magnitude = _clamp(abs(net) / _FLOW_SATURATION, 0.0, 1.0)
     contribution = (1 if net > 0 else -1) * magnitude * weight
     verb = "net buying" if net > 0 else "net selling"
-    factors.append(_factor(category, f"{category}_flow", contribution, f"{verb} ({net:+d}) - note disclosure lag"))
+    factors.append(
+        _factor(
+            category,
+            f"{category}_flow",
+            contribution,
+            f"{verb} ({net:+.1f} size-weighted across {count}) - note disclosure lag",
+        )
+    )
 
 
 def _divergence_penalty(dossier: dict[str, Any]) -> float:
@@ -331,13 +403,25 @@ def _divergence_penalty(dossier: dict[str, Any]) -> float:
     return _clamp(abs(score), 0.0, 1.0)
 
 
-def _score_factors(dossier: dict[str, Any], factors: list[dict[str, Any]]) -> None:
+def _score_factors(
+    dossier: dict[str, Any],
+    factors: list[dict[str, Any]],
+    *,
+    mom_saturation: float = 0.30,
+    trend_saturation: float = 0.10,
+    p52_band: float = 0.15,
+) -> None:
     """Score the quant factor block (momentum/trend/value/quality) into factors.
 
     Reads ``dossier["factors"]`` (from :func:`analysis.factors.compute_factors`).
     Absolute thresholds are used for value/quality (a simplification — these are
     most powerful cross-sectionally; see plan.md §10). Realized vol is *not* scored
     directionally here — it feeds position sizing instead.
+
+    The defaults calibrate the price factors for *equity daily* bars (a ±30% 12-1
+    move / ±10% vs the 200-DMA saturates). Callers scoring non-daily bars (the
+    crypto engine) must pass interval-appropriate saturations — on 15m bars the
+    same windows span ~2.6 days and the daily thresholds are unreachable.
     """
     block = dossier.get("factors")
     if not isinstance(block, dict):
@@ -345,22 +429,22 @@ def _score_factors(dossier: dict[str, Any], factors: list[dict[str, Any]]) -> No
 
     mom = _as_float(block.get("momentum_12_1"))
     if mom is not None:
-        c = _clamp(mom / 0.30, -1.0, 1.0) * _FACTOR_MOMENTUM_WEIGHT
+        c = _clamp(mom / mom_saturation, -1.0, 1.0) * _FACTOR_MOMENTUM_WEIGHT
         if abs(c) > 1e-9:
-            factors.append(_factor("momentum", "momentum_12_1", c, f"12-1 momentum {mom:+.1%}"))
+            factors.append(_factor("momentum", "momentum_12_1", c, f"window momentum {mom:+.1%}"))
 
     trend = _as_float(block.get("trend_200"))
     if trend is not None:
-        c = _clamp(trend / 0.10, -1.0, 1.0) * _FACTOR_TREND_WEIGHT
+        c = _clamp(trend / trend_saturation, -1.0, 1.0) * _FACTOR_TREND_WEIGHT
         if abs(c) > 1e-9:
             where = "above" if trend > 0 else "below"
-            factors.append(_factor("trend", "trend_200", c, f"{where} 200DMA ({trend:+.1%})"))
+            factors.append(_factor("trend", "trend_200", c, f"{where} 200-bar SMA ({trend:+.1%})"))
 
     p52 = _as_float(block.get("pct_52w_high"))
     if p52 is not None:
-        c = _clamp((p52 - 0.85) / 0.15, -1.0, 1.0) * _FACTOR_52WHIGH_WEIGHT
+        c = _clamp((p52 - (1.0 - p52_band)) / p52_band, -1.0, 1.0) * _FACTOR_52WHIGH_WEIGHT
         if abs(c) > 1e-9:
-            factors.append(_factor("momentum", "pct_52w_high", c, f"{p52:.0%} of 52w high"))
+            factors.append(_factor("momentum", "pct_52w_high", c, f"{p52:.0%} of window high"))
 
     value_subs: list[float] = []
     ey = _as_float(block.get("earnings_yield"))
@@ -378,7 +462,8 @@ def _score_factors(dossier: dict[str, Any], factors: list[dict[str, Any]]) -> No
             factors.append(_factor("value", "value", c, f"value composite ({len(value_subs)} inputs)"))
 
     q_subs: list[float] = []
-    gp = _as_float(block.get("gross_profitability"))
+    # Gross margin (GP/revenue) — the free proxy for profitability quality.
+    gp = _as_float(block.get("gross_margin", block.get("gross_profitability")))
     if gp is not None:
         q_subs.append(_clamp((gp - 0.30) / 0.30, -1.0, 1.0))
     roe = _as_float(block.get("roe"))
