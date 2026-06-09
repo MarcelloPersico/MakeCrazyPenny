@@ -341,6 +341,170 @@ class Filing:
         }
 
 
+# ---------------------------------------------------------------------------
+# Decision layer (see CONTRACT.md §5.1, §10.3). The debate-driven decision
+# engine turns the read-only evidence dossier into an explicit, autonomous
+# trade decision. These are plain value objects too — no SDK, no I/O.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DebateArgument:
+    """One side's argument in a single debate round.
+
+    Attributes:
+        side: ``"bull"`` or ``"bear"`` — which case this argument makes.
+        round: 1-based round index (round 1 = opening; >1 = rebuttal).
+        thesis: The argument's headline claim (one or two sentences).
+        key_points: The supporting points, each tied to concrete evidence.
+        cited_evidence: Short references to the dossier items relied on
+            (e.g. ``"RSI 24 (oversold)"``, ``"consensus 18 buy / 2 sell"``).
+        conviction: The advocate's self-rated strength of its own case in
+            ``[0, 1]`` (``None`` if it did not provide one).
+        rebuts: For rebuttal rounds, the opponent points this argument answers.
+    """
+
+    side: str
+    round: int
+    thesis: str
+    key_points: list[str] = field(default_factory=list)
+    cited_evidence: list[str] = field(default_factory=list)
+    conviction: float | None = None
+    rebuts: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "side": self.side,
+            "round": self.round,
+            "thesis": self.thesis,
+            "key_points": list(self.key_points),
+            "cited_evidence": list(self.cited_evidence),
+            "conviction": self.conviction,
+            "rebuts": list(self.rebuts),
+        }
+
+
+@dataclass
+class DebateTranscript:
+    """The full bull-vs-bear debate for one symbol.
+
+    Attributes:
+        symbol: The ticker debated.
+        rounds: Number of rounds actually run.
+        arguments: All arguments in chronological order (bull/bear interleaved).
+    """
+
+    symbol: str
+    rounds: int = 0
+    arguments: list[DebateArgument] = field(default_factory=list)
+
+    def for_side(self, side: str) -> list[DebateArgument]:
+        """Return this side's arguments in round order."""
+        return [a for a in self.arguments if a.side == side]
+
+    def latest(self, side: str) -> DebateArgument | None:
+        """Return the most recent argument for ``side`` (or ``None``)."""
+        args = self.for_side(side)
+        return args[-1] if args else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "symbol": self.symbol,
+            "rounds": self.rounds,
+            "arguments": [a.to_dict() for a in self.arguments],
+        }
+
+
+@dataclass
+class TradeDecision:
+    """An autonomous trade decision for one symbol (see CONTRACT.md §10.3).
+
+    The decision space is intentionally small and unambiguous:
+
+      * ``action`` ∈ {``"BUY"``, ``"SHORT"``, ``"AVOID"``} — what to do.
+      * ``direction`` ∈ {``"LONG"``, ``"SHORT"``, ``"FLAT"``} — the resulting
+        exposure.
+
+    Attributes:
+        symbol: The ticker decided on.
+        action: ``"BUY"`` (open long), ``"SHORT"`` (open short), or ``"AVOID"``.
+        direction: ``"LONG"`` / ``"SHORT"`` / ``"FLAT"`` (mirrors ``action``).
+        conviction: Confidence in ``[0, 1]``.
+        horizon: Intended holding horizon
+            (``"intraday"`` / ``"swing"`` / ``"position"`` / ``"long_term"``).
+        suggested_sizing: Qualitative position size (e.g. ``"small"`` when
+            uncertainty is high). Never a dollar amount — this is not advice.
+        summary: One-line human-readable verdict.
+        rationale: The decisive reasons behind the verdict.
+        bull_case: The strongest points for going long.
+        bear_case: The strongest points against / for shorting.
+        risks: What could go wrong with this decision.
+        invalidation: The condition that would flip the thesis.
+        net_score: Quant backbone net score (positive = bullish).
+        bull_score: Sum of bullish quant contributions.
+        bear_score: Sum of bearish quant contributions.
+        factors: The per-factor quant breakdown (deterministic backbone).
+        method: ``"quant"`` (the deterministic baseline) or ``"debate"`` (the
+            host's bull/bear/judge verdict merged with the quant backbone via the
+            ``finalize_decision`` MCP tool).
+        data_quality: Coverage / missing-data / divergence notes affecting trust.
+        transcript: An optional structured debate transcript. The debate itself
+            runs in the MCP host, so this is usually ``None``.
+        note: Optional operational note.
+        disclaimer: The not-investment-advice disclaimer (always present).
+    """
+
+    symbol: str
+    action: str
+    direction: str
+    conviction: float
+    horizon: str = "swing"
+    suggested_sizing: str = "small"
+    summary: str = ""
+    rationale: list[str] = field(default_factory=list)
+    bull_case: list[str] = field(default_factory=list)
+    bear_case: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    invalidation: str | None = None
+    net_score: float = 0.0
+    bull_score: float = 0.0
+    bear_score: float = 0.0
+    factors: list[dict[str, Any]] = field(default_factory=list)
+    method: str = "quant-only"
+    data_quality: dict[str, Any] = field(default_factory=dict)
+    transcript: DebateTranscript | None = None
+    note: str | None = None
+    disclaimer: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict representation."""
+        return {
+            "symbol": self.symbol,
+            "action": self.action,
+            "direction": self.direction,
+            "conviction": self.conviction,
+            "horizon": self.horizon,
+            "suggested_sizing": self.suggested_sizing,
+            "summary": self.summary,
+            "rationale": list(self.rationale),
+            "bull_case": list(self.bull_case),
+            "bear_case": list(self.bear_case),
+            "risks": list(self.risks),
+            "invalidation": self.invalidation,
+            "net_score": self.net_score,
+            "bull_score": self.bull_score,
+            "bear_score": self.bear_score,
+            "factors": [dict(f) for f in self.factors],
+            "method": self.method,
+            "data_quality": dict(self.data_quality),
+            "transcript": self.transcript.to_dict() if self.transcript else None,
+            "note": self.note,
+            "disclaimer": self.disclaimer,
+        }
+
+
 def to_dict(obj: Any) -> Any:
     """Best-effort conversion of a core value object (or list thereof) to JSON.
 
@@ -372,6 +536,9 @@ __all__ = [
     "PriceTarget",
     "UpgradeDowngrade",
     "Filing",
+    "DebateArgument",
+    "DebateTranscript",
+    "TradeDecision",
     "to_dict",
     "utcnow_iso",
 ]

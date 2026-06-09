@@ -26,6 +26,7 @@ from typing import Any
 from ..core.disclaimer import with_disclaimer
 from ..servers._sdk import SDK_AVAILABLE, ClaudeSDKClient
 from .agents import build_options
+from .debate import decide as run_decision
 
 # Exit codes.
 EXIT_OK = 0
@@ -148,6 +149,90 @@ async def run_orchestrator(symbol: str, depth: int) -> str:
     return "\n".join(collected).strip()
 
 
+def _bullets(items: list, *, empty: str = "(none)") -> str:
+    """Render a list as Markdown bullets, or a placeholder when empty.
+
+    Output is intentionally ASCII-only so it prints on a legacy Windows console
+    (cp1252) without an encoding error.
+    """
+    items = [str(i).strip() for i in (items or []) if str(i).strip()]
+    if not items:
+        return f"  {empty}"
+    return "\n".join(f"  - {i}" for i in items)
+
+
+def _format_decision(d: dict[str, Any]) -> str:
+    """Render a :class:`TradeDecision` dict as a readable CLI report.
+
+    The disclaimer is appended by the caller via :func:`with_disclaimer`, so it
+    is intentionally omitted here.
+    """
+    action = d.get("action", "?")
+    direction = d.get("direction", "?")
+    conviction = d.get("conviction", 0.0)
+    sym = d.get("symbol", "?")
+
+    lines: list[str] = [
+        f"DECISION for {sym}:  {action}  ({direction})",
+        f"Conviction: {float(conviction):.0%}   Horizon: {d.get('horizon', '?')}   "
+        f"Sizing: {d.get('suggested_sizing', '?')}",
+        "",
+        d.get("summary", ""),
+        "",
+        "Why:",
+        _bullets(d.get("rationale")),
+        "",
+        "Bull case (for going long):",
+        _bullets(d.get("bull_case")),
+        "",
+        "Bear case (against / for shorting):",
+        _bullets(d.get("bear_case")),
+        "",
+        "Risks:",
+        _bullets(d.get("risks")),
+    ]
+    if d.get("invalidation"):
+        lines += ["", f"Invalidation (what would flip this): {d['invalidation']}"]
+
+    lines += [
+        "",
+        (
+            f"Quant backbone: net {d.get('net_score', 0):+.2f} "
+            f"(bull {d.get('bull_score', 0):.2f} / bear {d.get('bear_score', 0):.2f}) "
+            f"across {d.get('data_quality', {}).get('n_factors', 0)} factors, "
+            f"coverage {d.get('data_quality', {}).get('coverage', 0):.0%}"
+        ),
+    ]
+    factors = d.get("factors") or []
+    if factors:
+        top = sorted(factors, key=lambda f: -abs(f.get("contribution", 0)))[:6]
+        for f in top:
+            lines.append(
+                f"  [{f.get('side', '?'):>4}] {f.get('detail', f.get('name', '?'))} "
+                f"({f.get('contribution', 0):+.2f})"
+            )
+
+    transcript = d.get("transcript")
+    if isinstance(transcript, dict) and transcript.get("arguments"):
+        lines += ["", f"Debate ({transcript.get('rounds', 0)} round(s)):"]
+        for a in transcript["arguments"]:
+            conv = a.get("conviction")
+            conv_s = f" [{float(conv):.0%}]" if isinstance(conv, (int, float)) else ""
+            lines.append(f"  {a.get('side', '?').upper()} r{a.get('round', '?')}{conv_s}: {a.get('thesis', '')}")
+
+    lines += ["", f"Method: {d.get('method', '?')}"]
+    if d.get("note"):
+        lines.append(f"Note: {d['note']}")
+    if d.get("method") == "quant":
+        lines.append(
+            "Tip: this is the deterministic quant baseline. For the full bull-vs-bear "
+            "AI debate (run on your own subscription), mount the MCP server "
+            "(makecrazypenny-mcp) in Claude Desktop/Code and run its `decide` prompt."
+        )
+
+    return "\n".join(lines)
+
+
 def _normalize_symbol(symbol: str) -> str:
     """Uppercase, strip whitespace, and strip a leading ``$`` from a symbol."""
     cleaned = symbol.strip()
@@ -161,8 +246,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="makecrazypenny",
         description=(
-            "Run the MakeCrazyPenny mother orchestrator over a stock symbol and "
-            "print a cross-checked report. Informational only; NOT investment advice."
+            "Run MakeCrazyPenny over a stock symbol. In 'decide' mode (default) a "
+            "bull and a bear advocate debate and an orchestrator decides BUY / SHORT "
+            "/ AVOID. In 'report' mode it prints a cross-checked research report. "
+            "Informational only; NOT investment advice."
         ),
     )
     parser.add_argument(
@@ -171,10 +258,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Ticker symbol to analyze (e.g. AAPL or $aapl).",
     )
     parser.add_argument(
+        "--mode",
+        choices=("decide", "report"),
+        default="decide",
+        help=(
+            "decide: deterministic BUY/SHORT/AVOID quant decision (default; no API "
+            "key). For the full bull/bear AI debate, mount the MCP server and run "
+            "its `decide` prompt. report: SDK cross-checked research report."
+        ),
+    )
+    parser.add_argument(
         "--depth",
         type=int,
         default=1,
-        help="Analysis depth: deeper means more delegation and cross-checking (default: 1).",
+        help="Report-mode analysis depth: more delegation/cross-checking (default: 1).",
     )
     return parser.parse_args(argv)
 
@@ -195,26 +292,32 @@ def cli(argv: list[str] | None = None) -> int:
         print("Error: a non-empty ticker symbol is required.", file=sys.stderr)
         return EXIT_RUNTIME_ERROR
 
-    if not SDK_AVAILABLE:
+    # 'decide' mode is the deterministic quant decision — AI-free, no API key. The
+    # full bull/bear debate runs in an MCP host (see `makecrazypenny.mcp_server`).
+    # 'report' mode still drives the legacy SDK orchestrator and needs the SDK.
+    if args.mode == "report" and not SDK_AVAILABLE:
         print(_INSTALL_HINT, file=sys.stderr)
         return EXIT_SDK_MISSING
 
     try:
-        report = asyncio.run(run_orchestrator(symbol, args.depth))
+        if args.mode == "decide":
+            decision = asyncio.run(run_decision(symbol))
+            output = _format_decision(decision.to_dict())
+        else:
+            output = asyncio.run(run_orchestrator(symbol, args.depth))
+            if not output:
+                output = f"No report was produced for {symbol}."
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return EXIT_RUNTIME_ERROR
     except Exception as exc:  # surface cleanly, no traceback
         print(
-            f"Error: the orchestrator failed: {type(exc).__name__}: {exc}",
+            f"Error: the {args.mode} run failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         return EXIT_RUNTIME_ERROR
 
-    if not report:
-        report = f"No report was produced for {symbol}."
-
-    print(with_disclaimer(report))
+    print(with_disclaimer(output))
     return EXIT_OK
 
 

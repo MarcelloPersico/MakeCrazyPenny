@@ -96,9 +96,11 @@ makecrazypenny/servers/congress.py
 makecrazypenny/servers/reports.py
 makecrazypenny/servers/synthesis.py
 makecrazypenny/servers/orchestration.py
+makecrazypenny/mcp_server.py            host-driven FastMCP server: tools + debate prompts (§10.4)
 makecrazypenny/orchestration/__init__.py                                      [DONE]
-makecrazypenny/orchestration/agents.py  AgentDefinitions + build_options()
-makecrazypenny/orchestration/main.py    CLI entrypoint
+makecrazypenny/orchestration/agents.py  AgentDefinitions + build_options() (report mode)
+makecrazypenny/orchestration/debate.py  deterministic decision engine (see §10.3)
+makecrazypenny/orchestration/main.py    CLI entrypoint (decide | report modes)
 tests/                                 mirrors source (see §11)
 ```
 
@@ -148,6 +150,20 @@ provider's raw payload needs mapping into the type.
 **`to_dict()` rule:** nested dataclasses (e.g. `provenance`, each `OHLCVBar`) are recursively
 converted to dicts so the result is directly JSON-encodable. The `score` field of
 `SentimentScore` is clamped to `[-1.0, 1.0]` by the normalizer.
+
+### 5.1 Decision types (decision layer, see §10.3)
+
+The debate-driven decision engine adds three value types (same conventions: plain
+`@dataclass`, `to_dict()`, optional fields default sensibly):
+
+| Type | Fields |
+|------|--------|
+| `DebateArgument` | `side: str` (`"bull"`/`"bear"`), `round: int`, `thesis: str`, `key_points: list[str]`, `cited_evidence: list[str]`, `conviction: float \| None` (0..1), `rebuts: list[str]` |
+| `DebateTranscript` | `symbol: str`, `rounds: int`, `arguments: list[DebateArgument]`; helpers `for_side(side)`, `latest(side)` |
+| `TradeDecision` | `symbol`, `action` (`"BUY"`/`"SHORT"`/`"AVOID"`), `direction` (`"LONG"`/`"SHORT"`/`"FLAT"`), `conviction: float` (0..1), `horizon`, `suggested_sizing`, `summary`, `rationale: list[str]`, `bull_case: list[str]`, `bear_case: list[str]`, `risks: list[str]`, `invalidation: str \| None`, `net_score`, `bull_score`, `bear_score`, `factors: list[dict]`, `method` (`"quant"`/`"debate"`), `data_quality: dict`, `transcript: DebateTranscript \| None`, `note: str \| None`, `disclaimer: str` |
+
+`TradeDecision` always carries the not-investment-advice `disclaimer` and the quant
+`factors` breakdown for transparency, even when an LLM judge sets the final call.
 
 ---
 
@@ -505,12 +521,68 @@ clear error only when actually invoked — but **importing `agents.py` must not 
 
 ### 10.2 `main.py`
 
-`argparse` CLI: `python -m makecrazypenny.orchestration.main SYMBOL [--depth N]`.
-- Runs the mother orchestrator on `SYMBOL`, prints the cross-checked report with the
-  disclaimer (`core.disclaimer.with_disclaimer`).
-- If the SDK is not installed, print install instructions (`pip install
-  'makecrazypenny[...]'` / `pip install claude-agent-sdk`) and exit **non-zero** gracefully
-  (no traceback).
+`argparse` CLI: `python -m makecrazypenny.orchestration.main SYMBOL [--mode decide|report]
+[--depth N]`.
+- **`--mode decide` (default):** runs the deterministic decision engine (§10.3) and prints a
+  `TradeDecision` (BUY/SHORT/AVOID + conviction, cases, risks, invalidation) with the
+  disclaimer. **AI-free — no SDK or API key required**, always exits 0. Output includes a tip
+  to run the full bull/bear debate via the MCP server (§10.4).
+- **`--mode report`:** runs the legacy mother orchestrator on `SYMBOL` (still SDK-backed) and
+  prints the cross-checked report. If the SDK is not installed, print install instructions and
+  exit **non-zero** gracefully (no traceback).
+- CLI output is strictly **ASCII** so it prints on any console.
+
+### 10.3 `debate.py` — deterministic decision engine
+
+The **pure, AI-free** core that turns evidence into a `TradeDecision`. It never calls a model
+and never needs an API key; the bull-vs-bear *debate* that can override it is run by an MCP
+**host** via §10.4. Fully offline-testable.
+
+```
+gather_evidence(symbol)        # fan out across ALL capability logic fns (tolerant)
+  → score_evidence(dossier)    # deterministic quant backbone (weighted factors)
+    → decide_from_scores(...)  # quant decision, optionally merged with a host verdict
+        → decide(symbol)        # top-level convenience (method="quant")
+```
+
+- **`gather_evidence(symbol, *, settings=None) -> dict`** — concurrent fan-out across the
+  `technical`/`sentiment`/`congress`/`reports`/`synthesis` **logic functions**; one failure
+  becomes an `{"_error": ...}` marker, never aborts the sweep.
+- **`score_evidence(dossier) -> dict`** — pure. Weights technical signals (golden/death cross
+  strongest), blended sentiment, analyst-consensus tilt, price-target upside, and
+  congressional/insider net flow into `factors` + `net_score`/`bull_score`/`bear_score`, plus a
+  cross-check `divergence_penalty`. Positive = bullish.
+- **`decide_from_scores(symbol, scored, *, transcript=None, verdict=None, method="quant",
+  note=None) -> TradeDecision`** — pure. Quant rule: take a position only when net passes the
+  threshold, conviction passes the floor, **and** the evidence is corroborated (≥2 categories or
+  a strongly stacked single category) — else `AVOID`. When the host hands back a structured
+  `verdict` (via the `finalize_decision` MCP tool), its validated fields override the
+  human-facing call while the quant scores/factors are preserved.
+- **`decide(symbol, *, settings=None) -> TradeDecision`** — gather → score → decide
+  (`method="quant"`). Always returns a real decision carrying the disclaimer.
+
+**Dependency direction.** `debate.py` is Layer 2: it imports `core` and the server **logic
+functions** (read-only) only. Never imported by a Layer-1 server (keeps the graph acyclic).
+
+### 10.4 `mcp_server.py` — host-driven MCP server (primary surface)
+
+A standalone **FastMCP stdio server** (built on the `mcp` package) that an MCP host (Claude
+Desktop / Claude Code) mounts. The host's own model — the user's subscription — runs the
+bull-vs-bear debate and the judgment; **no Anthropic API key, nothing billed per token.** Run
+via the `makecrazypenny-mcp` console script (or `python -m makecrazypenny.mcp_server`).
+
+- **Tools (deterministic, AI-free):** `decide` (quant baseline), `gather_evidence` (dossier +
+  quant), `technical_analysis`, `sentiment_analysis`, `congress_activity`, `analyst_reports`,
+  `cross_check`, and `finalize_decision(symbol, action, …)` which merges the host's debated
+  verdict with the quant backbone into the canonical `TradeDecision`. Each returns a JSON
+  string and never calls a model.
+- **Prompts (run by the host's model):** `decide` (orchestrates evidence → bull → bear →
+  rebuttals → judge → `finalize_decision`, suggesting host sub-agents for genuine adversarial
+  separation), plus `bull_case` / `bear_case` / `judge` personas for stepwise use. Symbols are
+  normalized; every prompt ends with the not-investment-advice reminder.
+
+Import-safe (no network at import); tools fetch lazily. Logs go to stderr so stdout stays a
+clean JSON-RPC stream.
 
 ---
 
@@ -527,6 +599,8 @@ Mirror the source tree. All tests deterministic and offline.
 | `test_providers_*.py` | mock `httpx` via `respx` (or monkeypatch) and `yfinance` via monkeypatch; assert normalization to core types + `MissingApiKey` behavior. |
 | `test_servers_*.py` | monkeypatch each server's `get_registry()` to a fake returning canned data; assert tool logic shapes the correct content dict; technical indicators computed on a synthetic OHLCV frame. |
 | `test_imports.py` | importing every module in `makecrazypenny.*` succeeds with no keys and (ideally) without optional libs present. |
+| `test_debate.py` | quant backbone scores bullish/bearish/thin dossiers correctly; `decide_from_scores` maps to BUY/SHORT/AVOID and a host verdict overrides; `gather_evidence` tolerates failures; `decide` is deterministic `method="quant"`; CLI output is ASCII. |
+| `test_mcp_server.py` | FastMCP tools + prompts registered; prompt builders normalize the symbol and embed the bull/bear/judge flow; `decide`/`gather_evidence`/`finalize_decision` tools return correct JSON (verdict overrides quant); per-domain tools tolerate a single failure. All AI-free/offline. |
 
 ---
 

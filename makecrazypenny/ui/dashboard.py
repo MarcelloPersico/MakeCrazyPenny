@@ -209,6 +209,93 @@ def _safe_panel(title: str, payload: Any, render_fn) -> None:
         st.json(payload)
 
 
+def _decision_dossier(symbol: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Map the dashboard's fetched ``data`` into the debate-engine dossier shape.
+
+    The scorer is defensive, so ``{"_error": ...}`` markers simply contribute
+    nothing rather than breaking the decision.
+    """
+    return {
+        "symbol": symbol,
+        "signals": data.get("signals"),
+        "mtf": data.get("mtf"),
+        "sentiment": data.get("aggregate_sentiment"),
+        "congress": data.get("congress_trades"),
+        "insider": data.get("insider"),
+        "ratings": data.get("ratings"),
+        "price_targets": data.get("price_targets"),
+        "upgrades": data.get("upgrades"),
+        "cross_check": data.get("cross_check"),
+    }
+
+
+def _render_decision(symbol: str, data: dict[str, Any]) -> None:
+    """Render the autonomous BUY/SHORT/AVOID decision (headline panel).
+
+    The instant verdict is the deterministic quant backbone computed from the
+    already-fetched evidence. A button runs the full bull-vs-bear AI debate +
+    orchestrator judge (needs the Claude Agent SDK and API keys).
+    """
+    from makecrazypenny.orchestration.debate import (
+        decide_from_scores,
+        score_evidence,
+    )
+
+    st.caption(
+        "An autonomous decision: a bull and a bear debate the evidence and an "
+        "orchestrator decides. The instant verdict below is the deterministic "
+        "quant backbone; run the full AI debate for the reasoned version."
+    )
+
+    dossier = _decision_dossier(symbol, data)
+    scored = score_evidence(dossier)
+    dec = decide_from_scores(symbol, scored, method="quant-only").to_dict()
+
+    action = dec["action"]
+    badge = {"BUY": "🟢 BUY (go long)", "SHORT": "🔴 SHORT", "AVOID": "🟡 AVOID"}.get(action, action)
+    c1, c2, c3 = st.columns([2, 1, 1])
+    c1.metric("Verdict", badge)
+    c2.metric("Conviction", fmt_pct(dec["conviction"]))
+    c3.metric("Net score", fmt_num(dec["net_score"]))
+    st.progress(min(1.0, max(0.0, float(dec["conviction"]))))
+    if dec.get("summary"):
+        st.markdown(f"**{dec['summary']}**")
+
+    bcol, rcol = st.columns(2)
+    with bcol:
+        st.markdown("**🟢 Bull case**")
+        for pt in dec.get("bull_case") or ["—"]:
+            st.markdown(f"- {pt}")
+    with rcol:
+        st.markdown("**🔴 Bear case**")
+        for pt in dec.get("bear_case") or ["—"]:
+            st.markdown(f"- {pt}")
+
+    factors = dec.get("factors") or []
+    if factors:
+        with st.expander("Quant factor breakdown"):
+            st.dataframe(
+                pd.DataFrame(factors)[["category", "name", "side", "contribution", "detail"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+    st.markdown("**Full bull vs bear AI debate**")
+    st.caption(
+        "The verdict above is the deterministic quant baseline. The full "
+        "bull-vs-bear debate runs on **your own Claude subscription** via the MCP "
+        "server — no API key, nothing billed per token. Mount it in your MCP host "
+        "(Claude Desktop / Claude Code) and run the `decide` prompt:"
+    )
+    st.code("claude mcp add makecrazypenny -- makecrazypenny-mcp", language="bash")
+    st.markdown(f"Then in the host, run the **/decide** prompt for `{symbol}` (it orchestrates bull → bear → judge using this server's tools).")
+    from makecrazypenny.mcp_server import build_decide_prompt
+
+    with st.expander("Preview the `decide` prompt the host will run"):
+        st.code(build_decide_prompt(symbol), language="text")
+
+
 def _render_overview(data: dict[str, Any]) -> None:
     cc = data.get("cross_check", {})
     err = has_error(cc)
@@ -496,9 +583,11 @@ def render() -> None:
         data = loader(**params)
 
     st.subheader(f"Results for {params['symbol']}")
-    tab_overview, tab_tech, tab_sent, tab_cong, tab_rep = st.tabs(
-        ["📊 Overview", "📈 Technical", "📰 Sentiment", "🏛 Congress", "🎯 Reports"]
+    tab_decision, tab_overview, tab_tech, tab_sent, tab_cong, tab_rep = st.tabs(
+        ["⚖️ Decision", "📊 Overview", "📈 Technical", "📰 Sentiment", "🏛 Congress", "🎯 Reports"]
     )
+    with tab_decision:
+        _safe_panel("Decision", data, lambda d: _render_decision(params["symbol"], d))
     with tab_overview:
         _render_overview(data)
     with tab_tech:

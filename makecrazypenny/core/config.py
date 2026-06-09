@@ -170,6 +170,9 @@ class Settings:
     max_depth: int = 3
     max_budget_usd: float = 1.0
 
+    #: Number of bull-vs-bear rebuttal rounds in the decision debate (§10.3).
+    debate_rounds: int = 2
+
     circuit_fail_threshold: int = 5
     circuit_cooldown_s: float = 60.0
     l2_cache_enabled: bool = True
@@ -259,6 +262,7 @@ class Settings:
             edgar_user_agent=os.environ.get("MCP_EDGAR_USER_AGENT") or DEFAULT_EDGAR_USER_AGENT,
             max_depth=_int_env("MCP_MAX_DEPTH", 3),
             max_budget_usd=_float_env("MCP_MAX_BUDGET_USD", 1.0),
+            debate_rounds=_int_env("MCP_DEBATE_ROUNDS", 2),
             circuit_fail_threshold=_int_env("MCP_CIRCUIT_FAIL_THRESHOLD", 5),
             circuit_cooldown_s=_float_env("MCP_CIRCUIT_COOLDOWN_S", 60.0),
             l2_cache_enabled=(os.environ.get("MCP_L2_CACHE", "1").strip() not in ("0", "false", "False")),

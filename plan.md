@@ -328,3 +328,98 @@ capability server still maps to one community; Layer 0 simply becomes their shar
 Re-run the graph after implementation (`/graphify . --update`) to confirm `ProviderRegistry`
 becomes the new provider-side hub and that no Layer-1 server depends on another except
 `synthesis`.
+
+---
+
+## 8. The debate-driven decision layer (autonomous buy / short / avoid)
+
+The first build delivered a **research-report generator**: the mother orchestrator delegated
+to four *read-only* analysts (technical, sentiment, congress, reports) and synthesized a
+cross-checked report. Every analyst prompt explicitly said *"do not give buy/sell
+recommendations."* A `/graphify . --update` over the implemented codebase confirmed this — the
+graph's own hyperedges describe the flow as *"orchestrate → delegate → synthesize"* with *"four
+specialist sub-agents"*, none of which decide anything.
+
+This layer closes that gap: a **fully autonomous decision** — `BUY` (go long), `SHORT`, or
+`AVOID` — produced by an adversarial **bull-vs-bear debate** that an orchestrator/judge
+adjudicates. It is the brief's headline requirement realized.
+
+### 8.1 Who runs the AI: the host, not an API key
+
+A deliberate design choice (see CONTRACT.md §10.4): the AI reasoning is **not** driven by our
+code calling the Anthropic API. Instead MakeCrazyPenny ships as a **stdio MCP server**
+(`mcp_server.py`, built on FastMCP) that an MCP host — Claude Desktop or Claude Code — mounts.
+**The host's own model, on the user's subscription, runs the debate.** No `ANTHROPIC_API_KEY`,
+nothing billed per token.
+
+> *Why not MCP "sampling"?* The MCP spec's sampling capability (a server asking the host's
+> model to complete) would be the cleanest fit, but no Claude host implements it yet
+> (`anthropics/claude-code#1785`). **MCP prompts** are the supported mechanism today, so the
+> server exposes the debate as prompts the host's model executes, plus deterministic tools it
+> calls for evidence.
+
+### 8.2 Pipeline
+
+```
+   MCP HOST (your subscription)                 MakeCrazyPenny MCP server (deterministic)
+   ────────────────────────────                ─────────────────────────────────────────
+   run prompt  /decide AAPL  ───────────────▶  decide / gather_evidence tools
+        │                                         fan out across ALL capability servers
+        │  ◀───────────────────────────────────  dossier + quant score (factors, net)
+        ▼
+   BULL advocate  ⇄  BEAR advocate   (host's model role-plays / spawns sub-agents,
+        │                             calling technical/sentiment/congress/reports/
+        │                             cross_check tools + its own web search to dig)
+        ▼
+   JUDGE weighs argument QUALITY (not an average) ─▶ finalize_decision(action, …) tool
+                                                       merges verdict + quant backbone
+                                                 ◀──── canonical TradeDecision + disclaimer
+```
+
+The server provides **evidence + a deterministic baseline + the persona prompts**; the host's
+model provides the **debate and judgment**.
+
+### 8.3 Why a debate (not a single classifier)
+
+A lone scorer is brittle and over-confident: it has no mechanism to surface the *strongest
+counter-case*. Forcing a dedicated advocate to argue **each** side, then having a judge weigh
+argument quality, is an adversarial check — the same pattern that makes red-teaming and
+devil's-advocate review effective. The advocates are told to be persuasive but honest (cite
+concrete numbers; the judge verifies), so the debate surfaces the real bull and bear theses
+instead of an averaged mush. The `decide` prompt suggests the host spawn genuine `bull-advocate`
+/ `bear-advocate` sub-agents when it can, for true separation of contexts.
+
+### 8.4 The deterministic backbone (always a real decision)
+
+Under the debate is a **pure, AI-free quant backbone** (`score_evidence` / `decide_from_scores`
+in `debate.py`): technical signals (golden/death cross weighted highest), blended sentiment,
+analyst-consensus tilt, price-target upside, and congressional/insider net flow are combined
+into weighted factors and a net score, tempered by the cross-check divergence and an
+evidence-corroboration rule (take a position only when ≥2 categories agree or one is strongly
+stacked — otherwise `AVOID`). This backbone:
+
+- needs **no model, no API key, no network mock** → fully unit-testable offline
+  (`test_debate.py`, `test_mcp_server.py`);
+- is exposed directly as the `decide` MCP tool and the `makecrazypenny … --mode decide` CLI, so
+  you always get a real `TradeDecision` even before any debate; and
+- is what the host's judgment refines: `finalize_decision` merges the host's verdict over the
+  quant call while preserving the scores/factors for transparency.
+
+### 8.5 Where it lives (layering preserved)
+
+- **MCP surface** — `makecrazypenny/mcp_server.py` (FastMCP): deterministic **tools**
+  (`decide`, `gather_evidence`, the per-domain analysis tools, `finalize_decision`) + **prompts**
+  (`decide`, `bull_case`, `bear_case`, `judge`). Console script `makecrazypenny-mcp`.
+- **Engine** — `orchestration/debate.py`: pure, imports `core` + the server **read-only logic
+  functions** only; **no Layer-1 server imports it**, so the dependency graph stays acyclic (the
+  property §7 worked to preserve). The legacy SDK/API debate path was removed entirely.
+- **Other surfaces:** `makecrazypenny … --mode decide` prints the deterministic decision; the
+  Streamlit dashboard's headline **⚖️ Decision** tab shows it and explains how to run the full
+  debate via the MCP server. `--mode report` keeps the original SDK research report.
+
+### 8.6 Not investment advice
+
+The decision is informational and educational. Every `TradeDecision` carries the
+`core/disclaimer.py` text and a transparent `factors` breakdown; every prompt ends with the
+reminder; the system never places an order and explicitly surfaces conviction, data gaps, and an
+invalidation condition.
