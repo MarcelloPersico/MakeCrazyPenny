@@ -1,4 +1,4 @@
-"""Tests for the crypto screen funnel (CONTRACT.md §16). Offline (fetch monkeypatched)."""
+﻿"""Tests for the crypto screen funnel (CONTRACT.md Â§16). Offline (fetch monkeypatched)."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ async def test_screen_crypto_selects_longs_and_shorts(monkeypatch: pytest.Monkey
         "DUSDT": _decision("DUSDT", "SHORT", 0.3, -2.0),
     }
 
-    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None, **_kw: Any) -> TradeDecision:
         return verdicts[symbol]
 
     monkeypatch.setattr(cs, "fetch_top_perps", fake_top)
@@ -96,7 +96,7 @@ async def test_screen_crypto_tolerates_deep_dive_failure(monkeypatch: pytest.Mon
     async def fake_regime(*, settings: Any = None) -> dict[str, Any]:
         return {"regime": "caution", "gross_exposure": 0.6}
 
-    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None, **_kw: Any) -> TradeDecision:
         if symbol == "BUSDT":
             raise RuntimeError("data gap")
         return _decision("AUSDT", "BUY", 0.5, 3.0)
@@ -131,7 +131,7 @@ async def test_screen_crypto_filters_to_hyperliquid(monkeypatch: pytest.MonkeyPa
 
     seen: list[str] = []
 
-    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None, **_kw: Any) -> TradeDecision:
         seen.append(symbol)
         return _decision(symbol, "BUY", 0.5, 3.0)
 
@@ -162,7 +162,7 @@ async def test_screen_crypto_hyperliquid_only_false_skips_filter(monkeypatch: py
     async def fake_regime(*, settings: Any = None) -> dict[str, Any]:
         return {"regime": "risk_on", "gross_exposure": 1.0}
 
-    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None, **_kw: Any) -> TradeDecision:
         return _decision(symbol, "BUY", 0.5, 3.0)
 
     monkeypatch.setattr(cs, "fetch_top_perps", fake_top)

@@ -582,6 +582,187 @@ async def crypto_finalize_decision_tool(
 
 
 # ---------------------------------------------------------------------------
+# Swarm tools (CONTRACT.md §18) — keyless market/social/news reads + the
+# server-side swarm state (standing goal + decision/PnL journal)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="market_pulse",
+    title="Hyperliquid market pulse (whole universe, one call)",
+    description=(
+        "One-call Hyperliquid universe snapshot from the public info API: every perp's mark price, "
+        "24h change, hourly funding (+ annualized), open interest (USD), 24h volume, and max leverage, "
+        "PLUS newly listed perps detected by diffing the universe against the previous snapshot. "
+        "KEYLESS read-only market data; no orders ever flow through this path. The swarm's scout "
+        "calls this to spot movers, funding extremes, and fresh listings."
+    ),
+)
+async def market_pulse_tool() -> str:
+    """Return the Hyperliquid universe pulse + new listings as JSON."""
+    from .servers import crypto as cx
+
+    return _dumps(await cx.market_pulse())
+
+
+@mcp.tool(
+    name="orderflow",
+    title="Order-flow snapshot (taker flow, CVD, book imbalance)",
+    description=(
+        "Order-flow read for a symbol: taker buy/sell imbalance, cumulative volume delta (CVD) vs "
+        "price, top-trader-vs-crowd positioning spread, order-book depth imbalance (20bps band), and "
+        "Hyperliquid-vs-CEX price divergence. The depth/divergence numbers are ORDER-TIME gates (they "
+        "decay in minutes) - check them right before placing; the flow/positioning signals mirror "
+        "what the engine scores. Keyless."
+    ),
+)
+async def orderflow_tool(symbol: str, interval: str = "15m") -> str:
+    """Return the order-flow snapshot for ``symbol`` as JSON."""
+    from .servers import crypto as cx
+
+    return _dumps(await cx.orderflow(canonical_crypto(symbol), interval=interval))
+
+
+@mcp.tool(
+    name="social_scan",
+    title="Social-chatter scan (deterministic, keyless)",
+    description=(
+        "Deterministic social pulse for a symbol (or market-wide with no symbol): Reddit post "
+        "velocity vs the previous window (via the Arctic Shift mirror), StockTwits bullish/bearish "
+        "label tallies, 4chan /biz/ mention counts, and CoinGecko trending status. Pure counting - "
+        "no model anywhere; the swarm's haiku scout polls this cheaply and often. All text is "
+        "ASCII-sanitized."
+    ),
+)
+async def social_scan_tool(symbol: str = "CRYPTO", limit: int = 25) -> str:
+    """Return the deterministic social scan as JSON."""
+    from .servers import crypto as cx
+
+    sym = canonical_crypto(symbol) if symbol and symbol.upper() != "CRYPTO" else "CRYPTO"
+    return _dumps(await cx.social_scan(sym, limit=limit))
+
+
+@mcp.tool(
+    name="news_feed",
+    title="Crypto news feed (RSS aggregate)",
+    description=(
+        "Merged crypto news headlines for a symbol (or market-wide with no symbol) from "
+        "CoinTelegraph, CoinDesk, and Google News RSS - deduped, newest first, with age_minutes. "
+        "Headlines only; the swarm's news-reader agent opens the few articles that matter and "
+        "extracts catalysts. NOT scored by the quant engine (interpretation is host-side). Keyless."
+    ),
+)
+async def news_feed_tool(symbol: str = "CRYPTO", limit: int = 30) -> str:
+    """Return the merged news feed as JSON."""
+    from .servers import crypto as cx
+
+    sym = canonical_crypto(symbol) if symbol and symbol.upper() != "CRYPTO" else "CRYPTO"
+    return _dumps(await cx.news_feed(sym, limit=limit))
+
+
+@mcp.tool(
+    name="swarm_goal_get",
+    title="Read the swarm's standing goal",
+    description=(
+        "Read the trading swarm's standing goal (persisted server-side so stateless scheduled "
+        "cycles share one objective). Returns {goal: null} when unset."
+    ),
+)
+def swarm_goal_get_tool() -> str:
+    """Return the standing goal record as JSON."""
+    from .orchestration import journal as journal_mod
+
+    return _dumps(journal_mod.goal_get())
+
+
+@mcp.tool(
+    name="swarm_goal_set",
+    title="Set the swarm's standing goal",
+    description=(
+        "Persist the trading swarm's standing goal (e.g. 'grow testnet equity with leveraged perp "
+        "trades; max 3 concurrent positions; prefer majors unless a listing edge appears'). "
+        "Subsequent swarm cycles read it via swarm_goal_get."
+    ),
+)
+def swarm_goal_set_tool(goal: str) -> str:
+    """Store the standing goal; return the stored record as JSON."""
+    from .orchestration import journal as journal_mod
+
+    return _dumps(journal_mod.goal_set(goal))
+
+
+@mcp.tool(
+    name="journal_record",
+    title="Journal a swarm cycle",
+    description=(
+        "Append one swarm-cycle record to the server-side journal: the scout/news/chart one-liners, "
+        "the fused decision, the action taken (or why none), and the thesis + invalidation for any "
+        "new trade. The journal is the swarm's memory across stateless cycles - write it every cycle."
+    ),
+)
+def journal_record_tool(
+    summary: str,
+    action: str = "none",
+    symbol: str | None = None,
+    thesis: str | None = None,
+    invalidation: str | None = None,
+    scout: str | None = None,
+    news: str | None = None,
+    chart: str | None = None,
+) -> str:
+    """Append a cycle record to the journal; return the stored entry as JSON."""
+    from .orchestration import journal as journal_mod
+
+    cycle: dict[str, Any] = {"summary": summary, "action": action}
+    if symbol:
+        cycle["symbol"] = canonical_crypto(symbol)
+    if thesis:
+        cycle["thesis"] = thesis
+    if invalidation:
+        cycle["invalidation"] = invalidation
+    if scout:
+        cycle["scout"] = scout
+    if news:
+        cycle["news"] = news
+    if chart:
+        cycle["chart"] = chart
+    return _dumps(journal_mod.record_cycle(cycle))
+
+
+@mcp.tool(
+    name="journal_recent",
+    title="Recent journal entries (decisions, cycles, equity)",
+    description=(
+        "The last n entries of each journal stream: engine decisions placed, swarm cycles, and "
+        "equity snapshots. The swarm reads this at the start of each cycle to recall open theses "
+        "and lessons. Keyless (reads local files only)."
+    ),
+)
+def journal_recent_tool(n: int = 10) -> str:
+    """Return the recent journal entries as JSON."""
+    from .orchestration import journal as journal_mod
+
+    return _dumps(journal_mod.recent(int(n)))
+
+
+@mcp.tool(
+    name="journal_performance",
+    title="Swarm performance scoreboard (PnL, hit rate)",
+    description=(
+        "Reconcile journaled decisions against actual testnet fills and return the scoreboard: "
+        "closed-trade count, hit rate, average R-multiple, realized PnL (total and per symbol), "
+        "open positions marked to market, and the equity-curve tail. Requires MCP_HL_PRIVATE_KEY "
+        "(it reads fills from the testnet); returns an _error marker when keyless."
+    ),
+)
+async def journal_performance_tool() -> str:
+    """Return the reconciled performance scoreboard as JSON."""
+    from .orchestration import journal as journal_mod
+
+    return _dumps(await journal_mod.performance())
+
+
+# ---------------------------------------------------------------------------
 # Paper-trading tools (Hyperliquid TESTNET; authenticated, state-mutating)
 # ---------------------------------------------------------------------------
 # These are the only tools that place orders. They act on the Hyperliquid testnet
@@ -1120,6 +1301,65 @@ def decide_crypto_market_prompt(top_n: str = "3", interval: str = "15m") -> str:
     except (TypeError, ValueError):
         n = 3
     return build_decide_crypto_market_prompt(n, interval or "15m")
+
+
+def build_trade_swarm_prompt(goal: str = "") -> str:
+    """Build the trading-swarm cycle playbook for the host's model (§18)."""
+    goal_line = (
+        f"Standing-goal override for this cycle: {goal.strip()}\n\n" if goal and goal.strip() else ""
+    )
+    return (
+        "You are running one full cycle of MakeCrazyPenny's TRADING SWARM on the Hyperliquid "
+        "TESTNET (paper money). You are the portfolio manager and the ONLY agent allowed to "
+        f"touch the paper_* trading tools.\n\n{goal_line}"
+        "0. CONTEXT - Call `swarm_goal_get` (if unset and no override was given, use: 'grow "
+        "testnet equity with leveraged perp trades, risk-gated'). Call `journal_performance` "
+        "and `journal_recent` (last 5) for open theses, hit rate, and lessons. Call "
+        "`paper_account` for equity, margin in use, and open positions.\n"
+        "1. FAN OUT - If you have a sub-agent / Task capability, spawn THREE agents in "
+        "parallel and give cheap fast models the cheap jobs: a HYPE SCOUT (fast/cheap model, "
+        "e.g. haiku) calling `market_pulse` + `social_scan` for new listings, hype velocity, "
+        "and funding extremes; a NEWS READER (mid model, e.g. sonnet) calling `news_feed` and "
+        "reading the few articles that matter for fresh catalysts; a CHART ANALYST (strong "
+        "model, e.g. opus) calling `crypto_regime` then `crypto_screen`/`crypto_decide` plus "
+        "`derivatives`/`orderflow` drill-ins, returning ranked setups with levels. Without "
+        "sub-agents, do the three sweeps yourself in that order.\n"
+        "2. FUSE - A setup is STRONG only when at least two independent legs agree (chart + "
+        "flow, or fresh catalyst + chart confirmation). A lone social spike is a watch, not a "
+        "trade. Pick the TIMEFRAME autonomously per setup: listing/hype momentum -> 5m-15m; "
+        "standard technical setup -> 15m-1h; multi-day catalyst or higher-timeframe trend -> "
+        "4h-1d. Pass it as `interval` everywhere. Respect the regime's gross-exposure scalar.\n"
+        "3. MANAGE FIRST - For each open position: is its journaled thesis intact? If "
+        "invalidated or the target structure is gone, `paper_close` it (or tighten with "
+        "`paper_set_tpsl`). Record why.\n"
+        "4. EXECUTE - Only for a STRONG setup the account can take: default to "
+        "`paper_trade_decision` (engine sizing + leverage + exchange-side SL/TP attached); use "
+        "`paper_open` with explicit size/stop_loss/take_profit only when your fused view "
+        "disagrees with engine sizing. If the risk gate refuses, do NOT fight it - journal the "
+        "refusal. No STRONG setup -> trade nothing; AVOID is a position.\n"
+        "5. JOURNAL + REPORT - Call `journal_record` with the cycle summary (scout/news/chart "
+        "one-liners, fused decision, action, thesis + invalidation). Then report: PnL and hit "
+        "rate from `journal_performance`, open positions with theses, what you did this cycle, "
+        "and what would change your mind before the next cycle.\n\n"
+        "Safety: testnet only, paper money - still treat it as real. Never disable the risk "
+        "gate; never raise leverage_cap above the engine default. This is informational only "
+        "and is NOT investment advice."
+    )
+
+
+@mcp.prompt(
+    name="trade_swarm",
+    title="Run one trading-swarm cycle (scout -> news -> TA -> fuse -> trade -> journal)",
+    description=(
+        "The swarm playbook: fan out scout/news/chart sub-agents (cheap models for cheap jobs), "
+        "fuse their reads, manage open positions, place at most the single best risk-gated trade "
+        "on the Hyperliquid testnet, and journal the cycle. Loop it (e.g. every 15-30 min) to "
+        "stay on top of the market."
+    ),
+)
+def trade_swarm_prompt(goal: str = "") -> str:
+    """MCP prompt: one full swarm cycle, optionally with a goal override."""
+    return build_trade_swarm_prompt(goal or "")
 
 
 # Keep a reference so linters see the config import is intentional (settings are

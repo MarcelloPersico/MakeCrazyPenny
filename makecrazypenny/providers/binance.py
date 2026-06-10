@@ -2,8 +2,9 @@
 
 The richest **keyless** source of perpetual-futures market data: sub-minute
 klines plus the derivatives metrics that matter for leveraged short-window
-trading — funding rate, open interest, and the long/short account ratio. Talks
-to ``fapi.binance.com`` over ``httpx`` and normalizes into the crypto core types.
+trading — funding rate, open interest, the long/short account ratio, taker
+buy/sell flow, top-trader positioning, and settled-funding history. Talks to
+``fapi.binance.com`` over ``httpx`` and normalizes into the crypto core types.
 
 Geo note: the global Binance API is geo-blocked (HTTP 451) from some regions
 (e.g. US IPs). Any such failure is a normal exception that the
@@ -12,8 +13,9 @@ Geo note: the global Binance API is geo-blocked (HTTP 451) from some regions
 needed here.
 
 Capabilities: ``crypto_ohlcv``, ``crypto_quote``, ``funding_rate``,
-``open_interest``, ``long_short_ratio``. No API key required. ``httpx`` is
-imported lazily so importing this module never hits the network.
+``open_interest``, ``long_short_ratio``, ``taker_flow``, ``top_trader_ratio``,
+``funding_history``. No API key required. ``httpx`` is imported lazily so
+importing this module never hits the network.
 """
 
 from __future__ import annotations
@@ -86,6 +88,25 @@ _INTERVAL_MIN: dict[str, float] = {
 }
 
 
+def _usdm_perp_or_skip(symbol: str, capability: str) -> str:
+    """Resolve ``symbol`` to a USDⓈ-M perp symbol, or raise ``NotImplementedError``.
+
+    The ``/futures/data/*`` statistics endpoints and ``/fapi/v1/fundingRate``
+    exist only for USD-margined perpetuals. A pair that canonicalizes to a
+    non-USDT quote (e.g. ``BTCEUR``, ``ETHBTC``) is a spot-only market on
+    Binance, so the futures-only capabilities raise ``NotImplementedError`` —
+    the :class:`ProviderRegistry` treats that as a silent skip (no circuit-
+    breaker trip) and the chain simply moves on.
+    """
+    sym = to_binance_perp(symbol)
+    if not sym.endswith("USDT"):
+        raise NotImplementedError(
+            f"Binance capability {capability!r} is futures-only; "
+            f"{sym!r} is not a USD-margined perpetual symbol."
+        )
+    return sym
+
+
 def _closest_period(interval: str, allowed: tuple[str, ...]) -> str:
     """Pick the *closest* valid stats period for a kline interval.
 
@@ -111,6 +132,9 @@ class BinanceProvider(Provider):
         "funding_rate",
         "open_interest",
         "long_short_ratio",
+        "taker_flow",
+        "top_trader_ratio",
+        "funding_history",
     }
     rate_per_min = 1200  # fapi allows a high weight budget; stay polite
     requires_key = None
@@ -149,6 +173,9 @@ class BinanceProvider(Provider):
             "funding_rate": self._fetch_funding_rate,
             "open_interest": self._fetch_open_interest,
             "long_short_ratio": self._fetch_long_short_ratio,
+            "taker_flow": self._fetch_taker_flow,
+            "top_trader_ratio": self._fetch_top_trader_ratio,
+            "funding_history": self._fetch_funding_history,
         }
         return await handlers[capability](**params)
 
@@ -157,7 +184,14 @@ class BinanceProvider(Provider):
     async def _fetch_ohlcv(
         self, symbol: str, interval: str = "5m", limit: int = 500, **_: Any
     ) -> dict[str, Any]:
-        """Normalize ``/fapi/v1/klines`` into :class:`OHLCV`."""
+        """Normalize ``/fapi/v1/klines`` into :class:`OHLCV` (+ taker-flow extras).
+
+        Each serialized bar row additionally carries ``quote_volume`` (kline
+        field 7) and ``taker_buy_volume`` (field 9, taker buy base-asset volume)
+        for the flow metrics (CVD). Additive only — the :class:`OHLCVBar` keys
+        (``ts``/``open``/``high``/``low``/``close``/``volume``) are unchanged;
+        a missing/invalid extra field is ``None``, never silently ``0.0``.
+        """
         sym = to_binance_perp(symbol)
         iv = _binance_interval(interval)
         payload = await self._get(
@@ -165,6 +199,7 @@ class BinanceProvider(Provider):
             {"symbol": sym, "interval": iv, "limit": max(1, min(int(limit), 1500))},
         )
         bars: list[OHLCVBar] = []
+        extras: list[dict[str, Any]] = []
         if isinstance(payload, list):
             for row in payload:
                 if not isinstance(row, (list, tuple)) or len(row) < 6:
@@ -183,7 +218,18 @@ class BinanceProvider(Provider):
                         volume=_to_float(row[5]) or 0.0,
                     )
                 )
-        return OHLCV(symbol=sym, interval=iv, bars=bars, provenance=self._provenance()).to_dict()
+                # Fields 7/9 are not part of the frozen OHLCVBar core type;
+                # they ride alongside and are merged into the rows below.
+                extras.append(
+                    {
+                        "quote_volume": _to_float(row[7]) if len(row) > 7 else None,
+                        "taker_buy_volume": _to_float(row[9]) if len(row) > 9 else None,
+                    }
+                )
+        result = OHLCV(symbol=sym, interval=iv, bars=bars, provenance=self._provenance()).to_dict()
+        for bar_row, extra in zip(result["bars"], extras):
+            bar_row.update(extra)
+        return result
 
     async def _fetch_quote(self, symbol: str, **_: Any) -> dict[str, Any]:
         """Normalize ``/fapi/v1/ticker/24hr`` into :class:`Quote`."""
@@ -318,6 +364,91 @@ class BinanceProvider(Provider):
             ts=_ms_to_iso(latest.get("timestamp")),
             provenance=self._provenance(),
         ).to_dict()
+
+    async def _fetch_taker_flow(
+        self, symbol: str, interval: str = "5m", limit: int = 48, **_: Any
+    ) -> dict[str, Any]:
+        """Normalize ``/futures/data/takerlongshortRatio`` into a taker-flow series.
+
+        Returns ``{"symbol", "series": [{"time", "buy_sell_ratio"}], "as_of"}``
+        oldest-first; ``buy_sell_ratio`` > 1 means taker buys exceeded taker
+        sells in that window (aggressive buying pressure). Futures-only:
+        spot-only pairs raise ``NotImplementedError`` (registry silent skip).
+        """
+        sym = _usdm_perp_or_skip(symbol, "taker_flow")
+        period = _closest_period(interval, _LS_PERIODS)
+        rows = await self._get(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": sym, "period": period, "limit": max(1, min(int(limit), 500))},
+        )
+        series: list[dict[str, Any]] = []
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                ts = _ms_to_iso(r.get("timestamp"))
+                ratio = _to_float(r.get("buySellRatio"))
+                if ts is None or ratio is None:
+                    continue
+                series.append({"time": ts, "buy_sell_ratio": ratio})
+        return {"symbol": sym, "series": series, "as_of": utcnow_iso()}
+
+    async def _fetch_top_trader_ratio(
+        self, symbol: str, interval: str = "5m", limit: int = 48, **_: Any
+    ) -> dict[str, Any]:
+        """Normalize ``/futures/data/topLongShortPositionRatio`` into a ratio series.
+
+        Top 20% of accounts by margin balance, **position**-weighted (not
+        account-counted) — the "smart money" side of the top-vs-crowd spread.
+        Returns ``{"symbol", "series": [{"time", "ratio"}], "as_of"}``
+        oldest-first. Futures-only: spot-only pairs raise
+        ``NotImplementedError`` (registry silent skip).
+        """
+        sym = _usdm_perp_or_skip(symbol, "top_trader_ratio")
+        period = _closest_period(interval, _LS_PERIODS)
+        rows = await self._get(
+            "/futures/data/topLongShortPositionRatio",
+            {"symbol": sym, "period": period, "limit": max(1, min(int(limit), 500))},
+        )
+        series: list[dict[str, Any]] = []
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                ts = _ms_to_iso(r.get("timestamp"))
+                ratio = _to_float(r.get("longShortRatio"))
+                if ts is None or ratio is None:
+                    continue
+                series.append({"time": ts, "ratio": ratio})
+        return {"symbol": sym, "series": series, "as_of": utcnow_iso()}
+
+    async def _fetch_funding_history(
+        self, symbol: str, limit: int = 66, **_: Any
+    ) -> dict[str, Any]:
+        """Normalize ``/fapi/v1/fundingRate`` (settled fundings) into a rate series.
+
+        Returns ``{"symbol", "rates": [{"time", "rate"}], "as_of"}`` oldest-
+        first. The default ``limit=66`` covers ~22 days of 8h settlements —
+        enough history for a trailing-21d funding z-score without over-
+        fetching. Futures-only: spot-only pairs raise ``NotImplementedError``
+        (registry silent skip).
+        """
+        sym = _usdm_perp_or_skip(symbol, "funding_history")
+        rows = await self._get(
+            "/fapi/v1/fundingRate",
+            {"symbol": sym, "limit": max(1, min(int(limit), 1000))},
+        )
+        rates: list[dict[str, Any]] = []
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                ts = _ms_to_iso(r.get("fundingTime"))
+                rate = _to_float(r.get("fundingRate"))
+                if ts is None or rate is None:
+                    continue
+                rates.append({"time": ts, "rate": rate})
+        return {"symbol": sym, "rates": rates, "as_of": utcnow_iso()}
 
 
 __all__ = ["BinanceProvider"]

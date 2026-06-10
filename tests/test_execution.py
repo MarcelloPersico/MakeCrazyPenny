@@ -188,6 +188,20 @@ def test_account_state_parsed(client: HyperliquidPaperClient) -> None:
     assert pos["coin"] == "BTC" and pos["leverage"] == 5.0 and pos["liquidation_price"] == 50000.0
 
 
+def test_spot_hold_not_double_counted(client: HyperliquidPaperClient) -> None:
+    """Spot USDC on ``hold`` backs open perp margin and already lives inside the
+    perp ``accountValue``; only free spot (total - hold) may fold into
+    ``tradable_usdc``, else sizing and the kill-switch baseline inflate by the
+    margin in use (observed live 2026-06-10: ~$191 counted twice)."""
+    info = client._fake_info  # type: ignore[attr-defined]
+    info.spot_user_state = lambda address: {
+        "balances": [{"coin": "USDC", "total": "992.11", "hold": "191.06"}]
+    }
+    state = client.account_state()
+    assert state["spot_usdc"] == pytest.approx(801.05)
+    assert state["tradable_usdc"] == pytest.approx(1000.0 + 801.05)
+
+
 def test_open_orders_and_fills_side_mapping(client: HyperliquidPaperClient) -> None:
     assert client.open_orders()["open_orders"][0]["side"] == "BUY"
     fills = client.recent_fills(limit=1)["fills"]

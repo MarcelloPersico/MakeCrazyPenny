@@ -227,6 +227,13 @@ class HyperliquidPaperClient:
         collateral into perp as needed, so a flat perp account can read ``$0``
         while the funds actually sit in spot. Surfacing this avoids a misleading
         zero and lets the decision sizer see the real account size.
+
+        Free means ``total - hold``: the auto-draw does NOT move USDC out of
+        spot — collateral backing open perp margin stays in the spot balance
+        flagged as ``hold``, and that same amount is already inside the perp
+        ``accountValue``. Counting ``total`` would double-count open margin in
+        ``tradable_usdc`` (inflating sizing and the kill-switch baseline by
+        exactly the margin in use).
         """
         info, _, address = self._ensure()
         try:
@@ -238,7 +245,11 @@ class HyperliquidPaperClient:
             return None
         for bal in balances:
             if isinstance(bal, dict) and bal.get("coin") == "USDC":
-                return _to_float(bal.get("total"))
+                total = _to_float(bal.get("total"))
+                if total is None:
+                    return None
+                hold = _to_float(bal.get("hold")) or 0.0
+                return max(0.0, total - hold)
         return 0.0
 
     def account_state(self) -> dict[str, Any]:

@@ -15,12 +15,18 @@ from __future__ import annotations
 from typing import Any
 
 from ..core.config import Settings, default_ttl
-from ..core.errors import AllProvidersFailed, MissingApiKey
+from ..core.errors import AllProvidersFailed, MissingApiKey, RateLimited
 from ..core.redact import redact_secrets
 from .base import PROVIDER_REGISTRY, Provider
 from .cache import TTLCache
 from .circuit import CircuitBreaker
 from .ratelimit import TokenBucket
+
+#: Ceiling on how long ``fetch`` will sleep for rate-limit tokens before moving
+#: on to the next provider in the chain. Generous enough for the politest free
+#: tiers (CoinGecko refills 1 token / 12s), but bounded so a drained bucket can
+#: never freeze a tool call indefinitely.
+_MAX_RATE_WAIT_S = 90.0
 
 
 class ProviderRegistry:
@@ -97,10 +103,11 @@ class ProviderRegistry:
 
         Walks ``settings.CAPABILITY_CHAINS[capability]`` in order. For each
         provider it skips ones that are missing, do not support the capability,
-        or whose circuit is open; acquires rate-limit tokens; and fetches
-        through the cache (single-flight). ``MissingApiKey`` and
-        ``NotImplementedError`` are silent skips that do NOT trip the breaker;
-        any other exception records a failure and continues down the chain.
+        or whose circuit is open; acquires rate-limit tokens (bounded by
+        ``_MAX_RATE_WAIT_S``); and fetches through the cache (single-flight).
+        ``MissingApiKey``, ``NotImplementedError``, and ``RateLimited`` are
+        silent skips that do NOT trip the breaker; any other exception records
+        a failure and continues down the chain.
 
         Args:
             capability: One of the FROZEN capability names.
@@ -135,13 +142,18 @@ class ProviderRegistry:
             try:
                 bucket = self._buckets.get(provider.rate_key)
                 if bucket is not None:
-                    await bucket.acquire(provider.cost)
+                    await bucket.acquire(provider.cost, max_wait=_MAX_RATE_WAIT_S)
 
                 result = await self._cache.get_or_fetch(
                     key=(name, capability, params),
                     ttl=effective_ttl,
                     factory=lambda p=provider: p.fetch(capability, **params),
                 )
+            except RateLimited as exc:
+                # Congestion, not a provider fault: skip down the chain without
+                # tripping the breaker; the bucket refills on its own.
+                reasons[name] = f"rate limited: {exc}"
+                continue
             except MissingApiKey as exc:
                 # Configuration fact: skip silently, do not trip the breaker.
                 reasons[name] = f"missing API key: {exc.env_var}"

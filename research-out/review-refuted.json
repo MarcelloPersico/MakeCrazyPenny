@@ -1,0 +1,18 @@
+[
+ {
+  "title": "Funding/flow factor stacking lets a single phenomenon bypass the corroboration gate \u2014 engine now takes trades it previously refused",
+  "why_refuted": "The claim's numbers are real \u2014 I reproduced both demonstrations with the venv python (funding-only dossier: factors -1.533/-1.0/-0.75, net -3.283, categories=['funding'], _quant_decision -> SHORT conv"
+ },
+ {
+  "title": "TradeDecision.as_of staleness check is documented but implemented nowhere \u2014 dead safety contract",
+  "why_refuted": "The claim's grep facts are accurate \u2014 as_of is stamped in enrich_crypto_decision (makecrazypenny/orchestration/crypto.py:469), serialized in to_dict (makecrazypenny/core/types.py:639), and never read "
+ },
+ {
+  "title": "CONTRACT SS18.1 says all three swarm agents 'EXCLUDE the paper_* tools', but hype-scout is granted mcp__makecrazypenny__paper_pairs",
+  "why_refuted": "The textual facts are accurate but the claim is a doc-wording nit, not a demonstrable bug. Verified: CONTRACT.md:1031-1032 says \"all three EXCLUDE the `paper_*` tools so only the host session can trad"
+ },
+ {
+  "title": "Design deliverable .claude/settings.json (read-only tool allowlist) was never shipped; unattended swarm loops stall on permission prompts out of the box",
+  "why_refuted": "The claim's observations are factually accurate (DESIGN-SWARM.md:188 lists .claude/settings.json; the staged tree ships only .claude/agents/* and .claude/commands/trade-swarm.md; README.md:380-387 doc"
+ }
+]

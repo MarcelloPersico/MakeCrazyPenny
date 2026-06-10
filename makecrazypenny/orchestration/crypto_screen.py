@@ -104,7 +104,16 @@ async def _deep_dive(
     async def _one(symbol: str) -> tuple[str, Any]:
         async with sem:
             try:
-                return ("ok", await decide_crypto(symbol, interval=interval, leverage_cap=leverage_cap, settings=settings))
+                # include_chatter=False: per-coin social/news rides slow shared
+                # rate buckets (CoinGecko ~5/min) and would serialize the dive.
+                decision = await decide_crypto(
+                    symbol,
+                    interval=interval,
+                    leverage_cap=leverage_cap,
+                    settings=settings,
+                    include_chatter=False,
+                )
+                return ("ok", decision)
             except Exception as exc:
                 return ("err", {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
 

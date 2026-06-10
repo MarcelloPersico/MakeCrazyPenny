@@ -919,8 +919,13 @@ remains informational/educational — testnet only, no real funds.
 
 ### 17.1 Safety rails (non-negotiable)
 
-- **Testnet-locked.** Only `Settings.hyperliquid_testnet_url` is ever used; there is **no mainnet
-  base URL field anywhere**. No env var or argument can route a signed order at real funds.
+- **Testnet-locked (write path).** Every **signed** request (orders, leverage, transfers) goes
+  through `Settings.hyperliquid_testnet_url` only; there is **no main-network base URL field on
+  the write path anywhere**, and no Settings attribute name may contain the substring "mainnet"
+  (asserted by the test suite). No env var or argument can route a signed order at real funds.
+  (§18's `hyperliquid_info_url` is a separate, strictly read-only market-DATA endpoint — keyless,
+  unsigned, used by `providers/hyperliquid_info.py` only; no order, signature, or key ever
+  touches it.)
 - **Import-safe.** The official `hyperliquid-python-sdk` (+ `eth_account`) is imported lazily inside
   `execution.hyperliquid._build_clients`; importing the package never needs the `trade` extra and
   never hits the network. The offline test suite runs without the SDK.
@@ -1006,3 +1011,81 @@ that the toolkit now accommodates:
   `tradable_usdc` (perp equity + free spot), and `open_from_decision` sizes against
   `tradable_usdc` so the decision path works when funds are in spot. Order placement still
   validates the coin against `info.meta()` as the hard backstop.
+
+## 18. Swarm extension — multi-agent trading loop (free data only)
+
+Turns the toolkit into an always-on **multi-agent trading swarm** while keeping every prior
+invariant: the app remains a pure MCP server, the engine stays AI-free and deterministic, all new
+data is keyless (free APIs / RSS / public mirrors), and the only write path is §17's testnet one.
+The swarm's MODELS come from the MCP host's own subscription (Claude Code sub-agents); the server
+supplies tools, the playbook prompt, and the persistent state.
+
+### 18.1 Division of labor (the architecture decision)
+
+- **MCP sampling is NOT used**: as of 2026-06 neither Claude Code nor Claude Desktop implements
+  `sampling/createMessage`, and FastMCP's fallback requires an API key (violates
+  subscription-only). Re-evaluate if anthropics/claude-code#1785 ships.
+- **The server ships:** deterministic data tools (§18.2), the swarm state (standing goal +
+  journal, §18.4), the risk gate (§18.5), and the `trade_swarm` PROMPT — the playbook the host's
+  model executes. **The repo ships:** `.claude/agents/` role definitions with `model:` frontmatter
+  (`hype-scout` = haiku, `news-reader` = sonnet, `chart-analyst` = opus; all three EXCLUDE the
+  order-placing `paper_*` tools — the scout may read the keyless `paper_pairs` listing — so only
+  the host session can trade) and `.claude/commands/trade-swarm.md`.
+- **The loop:** interactively `/loop 15m /trade-swarm` (or the `trade_swarm` MCP prompt); the
+  standing goal + journal live server-side precisely so stateless scheduled cycles share memory.
+
+### 18.2 New capabilities (keyless; routed per §14 chains)
+
+`hl_asset_ctx`, `hl_predicted_funding`, `hl_l2book`, `hl_funding_history`, `hl_market_pulse`
+(→ `providers/hyperliquid_info.py`, POST `{"type": ...}` to `hyperliquid_info_url`;
+`hl_market_pulse` also diffs the perp universe against a cached snapshot to detect NEW LISTINGS);
+`taker_flow`, `top_trader_ratio`, `funding_history` (→ `providers/binance.py` futures-data
+endpoints; klines additionally parse field 9 → `taker_buy_volume` for CVD); `social_scan`
+(→ `providers/social.py`: Arctic Shift Reddit mirror — reddit.com 403s datacenter IPs —,
+StockTwits platform-native Bullish/Bearish label COUNTING, 4chan /biz/ mention counting,
+CoinGecko trending; all text ASCII-sanitized at the boundary); `news_feed`
+(→ `providers/news_rss.py`: CoinTelegraph + CoinDesk + Google News RSS, stdlib XML, deduped).
+
+### 18.3 New scored factors (engine stays deterministic)
+
+`analysis/crypto_metrics.py`: `taker_flow_signal` (w 1.5, "flow"), `cvd_signal` (w 1.0, "flow"),
+`top_trader_spread_signal` (w 1.0, "positioning", FOLLOWS top traders), `funding_z_signal`
+(w 1.0, "funding", contrarian beyond |z|>=1.5 vs 21d), `predicted_funding_signal` (w 0.75,
+"funding", HL hourly + cross-venue forward), `social_velocity_signal` (w 0.5, "social",
+deterministic counting ONLY). `depth_imbalance` + `venue_divergence` are **order-time gates**
+(surfaced by the `orderflow` tool), never scored. LLM interpretations (news readings, scout
+narratives) NEVER enter `score_crypto_evidence` — they merge at host level via
+`crypto_finalize_decision`, same as the debate verdict. With more independent categories the
+crypto scorer demands broader corroboration: coverage norm 5 (vs 4), >=3 categories (or
+|net| >= 2.5) to act — carried in the scored dict, equity behavior unchanged. The leverage
+plan's funding COST is HL-first (hourly, the venue traded on), CEX fallback.
+`TradeDecision.as_of` stamps decision freshness.
+
+### 18.4 Journal + standing goal (`orchestration/journal.py`)
+
+Append-only JSONL under `cache_dir/journal/` (`decisions`, `cycles`, `equity`) + `goal.json`;
+tolerant readers skip corrupt lines. `record_decision` (auto-called on placement, with a
+generated `cloid` + exchange oids), `record_cycle`, `snapshot_equity`, `reconcile` (cloid → oid →
+symbol+window matching; realized PnL, R-multiple, win/loss), `performance()` (scoreboard:
+hit rate, avg R, PnL by symbol, equity tail), `goal_get`/`goal_set`. Journaling failure NEVER
+blocks an order. MCP tools: `swarm_goal_get`/`swarm_goal_set`, `journal_record`,
+`journal_recent`, `journal_performance`; plus data tools `market_pulse`, `orderflow`,
+`social_scan`, `news_feed`.
+
+### 18.5 Risk gate (in `paper_trade`, before any order)
+
+Same-direction position cap (`MCP_SWARM_MAX_POSITIONS`, default 3; same-coin adds exempt);
+daily-loss kill-switch (`MCP_SWARM_MAX_DAILY_LOSS_PCT`, default 5.0, vs the UTC-midnight equity
+snapshot — breach refuses new risk-increasing orders); correlated-exposure cap
+(`analysis/risk.correlated_exposure_check`: BTC-beta buckets, cap 2x equity, auto-downsize);
+`reduce_only` bypasses (risk-reducing). Refusals are `{placed: false, reason}` envelopes, never
+exceptions; every sub-check degrades defensively. `MCP_SWARM_RISK_GATE=off` disables (dangerous,
+documented). Sizing upgrades in `analysis/risk.py`: `parkinson_vol`/`yang_zhang_vol` (efficient
+estimators), `kelly_calibrated` (p shrunk toward realized journal hit-rate; quarter-Kelly until
+50 closed trades).
+
+### 18.6 Settings (env-overridable)
+
+`hyperliquid_info_url` (`MCP_HL_INFO_URL`; read-only data, see §17.1); risk-gate knobs above are
+read from the environment at call time (no Settings fields). New TTLs per §8.5 table in
+`core/config.py` (ctx/pulse 30s, l2book 5s, histories 300s, social 120s, news 300s).

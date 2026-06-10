@@ -71,19 +71,48 @@ async def test_gather_is_tolerant(monkeypatch: pytest.MonkeyPatch) -> None:
     async def ok_ohlcv(symbol: str, interval: str = "5m", limit: int = 500) -> dict[str, Any]:
         return {"bars": []}
 
+    async def ok_flow(symbol: str, interval: str = "15m") -> dict[str, Any]:
+        return {"taker_flow": {"series": []}}
+
+    async def ok_hl(symbol: str) -> dict[str, Any]:
+        return {"asset_ctx": {"funding_hourly": 0.0}}
+
+    async def ok_social(symbol: str = "CRYPTO", limit: int = 25) -> dict[str, Any]:
+        return {"scan": {"reddit": {"_error": "down"}}}
+
+    async def ok_news(symbol: str = "CRYPTO", limit: int = 30) -> dict[str, Any]:
+        return {"feed": {"items": []}}
+
     monkeypatch.setattr(cx, "multi_timeframe", ok_mtf)
     monkeypatch.setattr(cx, "crypto_signals", ok_signals)
     monkeypatch.setattr(cx, "derivatives", ok_deriv)
     monkeypatch.setattr(cx, "crypto_sentiment", ok_sent)
     monkeypatch.setattr(cx, "crypto_ohlcv", ok_ohlcv)
+    # Swarm extension seams: ALL evidence tasks must be patched or this
+    # "offline" test silently performs live HTTP through the new providers.
+    monkeypatch.setattr(cx, "flow_metrics", ok_flow)
+    monkeypatch.setattr(cx, "hl_context", ok_hl)
+    monkeypatch.setattr(cx, "social_scan", ok_social)
+    monkeypatch.setattr(cx, "news_feed", ok_news)
 
     dossier = await engine.gather_crypto_evidence("btc", interval="15m")
     assert "_error" in dossier["mtf"]  # the failing one is captured, not raised
     assert dossier["signals"] == {"signals": []}
+    assert dossier["flow"] == {"taker_flow": {"series": []}}
+    assert dossier["hl"] == {"asset_ctx": {"funding_hourly": 0.0}}
+    assert dossier["social"] == {"scan": {"reddit": {"_error": "down"}}}
+    assert dossier["news"] == {"feed": {"items": []}}
+
+    # The screener path skips the slow chatter sources entirely.
+    light = await engine.gather_crypto_evidence("btc", interval="15m", include_chatter=False)
+    assert "social" not in light and "news" not in light
+    assert "flow" in light and "hl" in light
 
 
 async def test_decide_crypto_attaches_leverage(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_gather(symbol: str, *, interval: str = "15m", settings: Any = None) -> dict[str, Any]:
+    async def fake_gather(
+        symbol: str, *, interval: str = "15m", settings: Any = None, **_kw: Any
+    ) -> dict[str, Any]:
         return _bullish_dossier()
 
     async def fake_regime(*, settings: Any = None) -> dict[str, Any]:
@@ -105,7 +134,9 @@ async def test_decide_crypto_attaches_leverage(monkeypatch: pytest.MonkeyPatch) 
 
 
 async def test_decide_crypto_scalp_horizon(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_gather(symbol: str, *, interval: str = "5m", settings: Any = None) -> dict[str, Any]:
+    async def fake_gather(
+        symbol: str, *, interval: str = "5m", settings: Any = None, **_kw: Any
+    ) -> dict[str, Any]:
         return _bullish_dossier()
 
     async def fake_regime(*, settings: Any = None) -> dict[str, Any]:

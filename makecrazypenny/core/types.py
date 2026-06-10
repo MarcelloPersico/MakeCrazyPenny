@@ -603,6 +603,10 @@ class TradeDecision:
     leverage: dict[str, Any] = field(default_factory=dict)
     transcript: DebateTranscript | None = None
     note: str | None = None
+    #: When the decision was produced (UTC ISO-8601). Decisions on minutes-scale
+    #: timeframes go stale fast; consumers (journal, swarm) check this before
+    #: acting on an old decision.
+    as_of: str | None = None
     disclaimer: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -632,6 +636,7 @@ class TradeDecision:
             "leverage": dict(self.leverage),
             "transcript": self.transcript.to_dict() if self.transcript else None,
             "note": self.note,
+            "as_of": self.as_of,
             "disclaimer": self.disclaimer,
         }
 

@@ -24,7 +24,15 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ..analysis.crypto_metrics import basis_value, oi_change_from_history
+from ..analysis.crypto_metrics import (
+    basis_value,
+    cvd_signal,
+    depth_imbalance,
+    oi_change_from_history,
+    taker_flow_signal,
+    top_trader_spread_signal,
+    venue_divergence,
+)
 from ..analysis.indicators import (
     DEFAULT_INDICATORS,
     compute_indicator_frame,
@@ -211,6 +219,139 @@ async def crypto_sentiment() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Swarm extension (CONTRACT.md §18) — flow, HL-native context, social, news
+# ---------------------------------------------------------------------------
+
+
+def _signal_block(sig: tuple[float, str] | None) -> dict[str, Any] | None:
+    """Render an analysis ``(strength, rationale)`` tuple as a JSON block."""
+    if sig is None:
+        return None
+    return {"strength": round(float(sig[0]), 4), "detail": sig[1]}
+
+
+async def flow_metrics(symbol: str, interval: str = "15m") -> dict[str, Any]:
+    """Gather the taker-flow evidence block (Binance futures, tolerant).
+
+    Returns the raw ``taker_flow`` / ``top_trader_ratio`` / ``funding_history``
+    payloads for the scorer; each sub-fetch degrades independently to an
+    ``{"_error": ...}`` marker.
+    """
+    sym = canonical_crypto(symbol)
+    registry = get_registry()
+    taker, top, hist, ohlcv = await asyncio.gather(
+        _fetch_data(registry, "taker_flow", symbol=sym, interval=interval, limit=48),
+        _fetch_data(registry, "top_trader_ratio", symbol=sym, interval=interval, limit=48),
+        _fetch_data(registry, "funding_history", symbol=sym, limit=66),
+        # Bars carry taker_buy_volume (Binance kline field 9) for the CVD read.
+        _fetch_data(registry, "crypto_ohlcv", symbol=sym, interval=interval, limit=100),
+        return_exceptions=False,
+    )
+    return {
+        "symbol": sym,
+        "interval": interval,
+        "taker_flow": taker,
+        "top_trader": top,
+        "funding_history": hist,
+        "ohlcv": ohlcv,
+        "disclaimer": DISCLAIMER,
+    }
+
+
+async def hl_context(symbol: str) -> dict[str, Any]:
+    """Gather the Hyperliquid-native context (asset ctx + predicted funding).
+
+    HL funding is hourly and is the venue-correct carry number for positions
+    held on Hyperliquid; predicted funding adds the cross-venue forward view.
+    """
+    sym = canonical_crypto(symbol)
+    registry = get_registry()
+    ctx, predicted = await asyncio.gather(
+        _fetch_data(registry, "hl_asset_ctx", symbol=sym),
+        _fetch_data(registry, "hl_predicted_funding", symbol=sym),
+        return_exceptions=False,
+    )
+    return {"symbol": sym, "asset_ctx": ctx, "predicted_funding": predicted, "disclaimer": DISCLAIMER}
+
+
+async def social_scan(symbol: str = "CRYPTO", limit: int = 25) -> dict[str, Any]:
+    """Deterministic social-chatter scan (Reddit velocity, StockTwits labels,
+    /biz/ mentions, CoinGecko trending). Pure counting — no model anywhere."""
+    registry = get_registry()
+    data = await _fetch_data(registry, "social_scan", symbol=symbol or "CRYPTO", limit=limit)
+    return {"symbol": symbol or "CRYPTO", "scan": data, "disclaimer": DISCLAIMER}
+
+
+async def news_feed(symbol: str = "CRYPTO", limit: int = 30) -> dict[str, Any]:
+    """Merged crypto news headlines (CoinTelegraph + CoinDesk + Google News),
+    newest first, ASCII titles. NOT scored by the engine — host-side reading."""
+    registry = get_registry()
+    data = await _fetch_data(registry, "news_feed", symbol=symbol or "CRYPTO", limit=limit)
+    return {"symbol": symbol or "CRYPTO", "feed": data, "disclaimer": DISCLAIMER}
+
+
+async def market_pulse() -> dict[str, Any]:
+    """One-call Hyperliquid universe snapshot: per-coin funding/OI/volume plus
+    newly listed perps (universe diff vs the persisted snapshot)."""
+    registry = get_registry()
+    data = await _fetch_data(registry, "hl_market_pulse")
+    return {"pulse": data, "disclaimer": DISCLAIMER}
+
+
+async def orderflow(symbol: str, interval: str = "15m") -> dict[str, Any]:
+    """Order-flow snapshot for a symbol: taker flow, CVD, top-trader spread,
+    book-depth imbalance, and HL-vs-CEX price divergence.
+
+    The depth/divergence values are ORDER-TIME GATES (they decay in minutes),
+    not scored factors; the flow/positioning signals mirror what the engine
+    scores so a host can drill into the why.
+    """
+    sym = canonical_crypto(symbol)
+    registry = get_registry()
+    taker, top, crowd, book, ctx, funding, ohlcv = await asyncio.gather(
+        _fetch_data(registry, "taker_flow", symbol=sym, interval=interval, limit=48),
+        _fetch_data(registry, "top_trader_ratio", symbol=sym, interval=interval, limit=48),
+        _fetch_data(registry, "long_short_ratio", symbol=sym, interval=interval),
+        _fetch_data(registry, "hl_l2book", symbol=sym),
+        _fetch_data(registry, "hl_asset_ctx", symbol=sym),
+        _fetch_data(registry, "funding_rate", symbol=sym),
+        _fetch_data(registry, "crypto_ohlcv", symbol=sym, interval=interval, limit=100),
+        return_exceptions=False,
+    )
+
+    result: dict[str, Any] = {"symbol": sym, "interval": interval, "disclaimer": DISCLAIMER}
+
+    taker_series = taker.get("series") if isinstance(taker, dict) and "_error" not in taker else None
+    result["taker_flow"] = _signal_block(taker_flow_signal(taker_series) if taker_series else None)
+
+    bars = ohlcv.get("bars") if isinstance(ohlcv, dict) and "_error" not in ohlcv else None
+    result["cvd"] = _signal_block(cvd_signal(bars) if bars else None)
+
+    top_latest: float | None = None
+    if isinstance(top, dict) and "_error" not in top:
+        series = top.get("series") or []
+        if series and isinstance(series[-1], dict):
+            top_latest = series[-1].get("ratio")
+    crowd_ratio = crowd.get("ratio") if isinstance(crowd, dict) and "_error" not in crowd else None
+    result["top_trader"] = _signal_block(top_trader_spread_signal(top_latest, crowd_ratio))
+
+    mid = ctx.get("mid_price") if isinstance(ctx, dict) and "_error" not in ctx else None
+    imbalance: float | None = None
+    if isinstance(book, dict) and "_error" not in book and mid:
+        imbalance = depth_imbalance(book.get("bids") or [], book.get("asks") or [], mid)
+    result["depth"] = {"imbalance": imbalance, "band_bps": 20.0, "mid": mid}
+
+    hl_mark = ctx.get("mark_price") if isinstance(ctx, dict) and "_error" not in ctx else None
+    cex_mark = funding.get("mark_price") if isinstance(funding, dict) and "_error" not in funding else None
+    result["venue"] = {
+        "hl_mark": hl_mark,
+        "cex_mark": cex_mark,
+        "divergence_bps": venue_divergence(hl_mark, cex_mark),
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
 # MCP tool wrappers (thin)
 # ---------------------------------------------------------------------------
 
@@ -285,6 +426,50 @@ async def crypto_sentiment_tool(args: dict[str, Any]) -> dict[str, Any]:
     return text_result(result)
 
 
+@tool(
+    "social_scan",
+    "Deterministic social-chatter scan: Reddit velocity, StockTwits bull/bear labels, /biz/ mentions, trending.",
+    {"symbol": str, "limit": int},
+)
+async def social_scan_tool(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP wrapper for :func:`social_scan`."""
+    result = await social_scan(args.get("symbol") or "CRYPTO", limit=int(args.get("limit", 25)))
+    return text_result(result)
+
+
+@tool(
+    "news_feed",
+    "Merged crypto news headlines (CoinTelegraph, CoinDesk, Google News), newest first.",
+    {"symbol": str, "limit": int},
+)
+async def news_feed_tool(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP wrapper for :func:`news_feed`."""
+    result = await news_feed(args.get("symbol") or "CRYPTO", limit=int(args.get("limit", 30)))
+    return text_result(result)
+
+
+@tool(
+    "market_pulse",
+    "Hyperliquid universe snapshot: per-coin funding/OI/volume/movers plus newly listed perps.",
+    {},
+)
+async def market_pulse_tool(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP wrapper for :func:`market_pulse`."""
+    result = await market_pulse()
+    return text_result(result)
+
+
+@tool(
+    "orderflow",
+    "Order-flow snapshot: taker flow, CVD, top-trader spread, book-depth imbalance, venue divergence.",
+    {"symbol": str, "interval": str},
+)
+async def orderflow_tool(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP wrapper for :func:`orderflow`."""
+    result = await orderflow(args["symbol"], interval=args.get("interval", "15m"))
+    return text_result(result)
+
+
 # ---------------------------------------------------------------------------
 # MCP server instance
 # ---------------------------------------------------------------------------
@@ -299,6 +484,10 @@ server = create_sdk_mcp_server(
         multi_timeframe_tool,
         derivatives_tool,
         crypto_sentiment_tool,
+        social_scan_tool,
+        news_feed_tool,
+        market_pulse_tool,
+        orderflow_tool,
     ],
 )
 
@@ -311,12 +500,22 @@ __all__ = [
     "multi_timeframe",
     "derivatives",
     "crypto_sentiment",
+    "flow_metrics",
+    "hl_context",
+    "social_scan",
+    "news_feed",
+    "market_pulse",
+    "orderflow",
     "crypto_ohlcv_tool",
     "crypto_indicators_tool",
     "crypto_signals_tool",
     "multi_timeframe_tool",
     "derivatives_tool",
     "crypto_sentiment_tool",
+    "social_scan_tool",
+    "news_feed_tool",
+    "market_pulse_tool",
+    "orderflow_tool",
     "server",
 ]
 

@@ -79,6 +79,10 @@ PROVIDER_ADAPTER_MODULES = (
     "makecrazypenny.providers.edgar",
     "makecrazypenny.providers.stockwatcher",
     "makecrazypenny.providers.marketaux",
+    # Swarm extension (CONTRACT.md §18): keyless HL info + social/news feeds.
+    "makecrazypenny.providers.hyperliquid_info",
+    "makecrazypenny.providers.social",
+    "makecrazypenny.providers.news_rss",
 )
 
 SERVER_MODULES = (
@@ -97,6 +101,8 @@ ORCHESTRATION_MODULES = (
     "makecrazypenny.orchestration",
     "makecrazypenny.orchestration.agents",
     "makecrazypenny.orchestration.main",
+    # Swarm extension (CONTRACT.md §18): the decision/PnL journal.
+    "makecrazypenny.orchestration.journal",
 )
 
 ALL_MODULES = (
@@ -147,8 +153,8 @@ def test_module_imports(module_name: str) -> None:
 
 def test_all_modules_collected() -> None:
     """The module manifest covers every layer (sanity on the parametrization)."""
-    # 6 core + 6 provider primitives + 7 adapters + 9 servers + 3 orchestration.
-    assert len(ALL_MODULES) == 31
+    # 6 core + 6 provider primitives + 10 adapters + 9 servers + 4 orchestration.
+    assert len(ALL_MODULES) == 35
     assert len(set(ALL_MODULES)) == len(ALL_MODULES)  # no duplicates
 
 
@@ -461,3 +467,19 @@ def test_orchestration_main_cli_surface() -> None:
 
     assert callable(main.cli)
     assert callable(main.main)
+
+
+def test_mcp_server_preloads_heavy_libs() -> None:
+    """The server entrypoint preloads the C-extension stack before serving.
+
+    Lazily importing numpy/pandas inside a request handler while the asyncio
+    loop is live can deadlock in the Windows DLL loader, freezing the whole
+    server. ``_preload_heavy_libs`` runs once, single-threaded, at startup.
+    """
+    import sys
+
+    from makecrazypenny.mcp_server import _preload_heavy_libs
+
+    _preload_heavy_libs()
+    assert "numpy" in sys.modules
+    assert "pandas" in sys.modules

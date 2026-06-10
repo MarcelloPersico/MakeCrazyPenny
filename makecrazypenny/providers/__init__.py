@@ -41,6 +41,10 @@ _PROVIDER_MODULES = (
     "bybit",
     "coingecko",
     "fear_greed",
+    # Swarm extension (CONTRACT.md §18): keyless HL info reads + social/news.
+    "hyperliquid_info",
+    "social",
+    "news_rss",
 )
 
 for _mod in _PROVIDER_MODULES:

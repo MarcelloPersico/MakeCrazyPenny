@@ -11,6 +11,9 @@ Asserted behaviors (per the CONTRACT test matrix):
 * a provider that raises ``MissingApiKey`` is a silent skip (chain continues,
   breaker untouched);
 * a provider whose circuit is open is skipped;
+* a drained rate bucket raises ``RateLimited`` (bounded wait) and the chain
+  falls through without tripping the breaker — a tool call can never hang
+  forever on token refill;
 * a provider that does not ``support`` the capability is skipped;
 * concurrent identical fetches collapse to a single upstream call
   (single-flight, implemented in the cache layer the registry relies on);
@@ -180,6 +183,32 @@ async def test_circuit_open_provider_skipped(tmp_path):
 
     assert out == {"provider": "backup", "data": {"px": 2}, "cached": False}
     assert flaky.calls == 0  # open circuit => never invoked
+
+
+async def test_rate_limited_bucket_falls_through(tmp_path, monkeypatch):
+    """A drained bucket whose refill exceeds the wait cap skips to the fallback.
+
+    The drained ``limited`` bucket would need ~60s to refill one token; the
+    patched wait cap makes the registry give up immediately instead of
+    sleeping, raising ``RateLimited`` internally and moving down the chain.
+    """
+    settings = make_settings(tmp_path, {"quote": ["limited", "fallback"]})
+    registry = ProviderRegistry(settings)
+
+    limited = FakeProvider("limited", {"quote"}, result={"px": 1}, rate_per_min=1)
+    fallback = FakeProvider("fallback", {"quote"}, result={"px": 2})
+    registry.register(limited)
+    registry.register(fallback)
+
+    registry._buckets["limited"]._tokens = 0.0
+    monkeypatch.setattr("makecrazypenny.providers.registry._MAX_RATE_WAIT_S", 0.05)
+
+    out = await registry.fetch("quote", symbol="AAPL")
+
+    assert out == {"provider": "fallback", "data": {"px": 2}, "cached": False}
+    assert limited.calls == 0  # tokens never became available; fetch never ran
+    # Congestion is not a health failure: the breaker stays closed.
+    assert registry._circuits["limited"].state == "closed"
 
 
 async def test_unsupported_capability_skipped(tmp_path):

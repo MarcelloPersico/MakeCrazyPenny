@@ -328,6 +328,67 @@ order tools that place a **real testnet** order and need `MCP_HL_PRIVATE_KEY`:
 
 > Testnet only — paper money. Still informational/educational; NOT investment advice.
 
+## The trading swarm (multi-agent loop, free data only)
+
+The swarm turns the toolkit into an always-on multi-model trading desk while the app
+stays a pure MCP server: **the server supplies deterministic tools, persistent state,
+and the playbook prompt; your Claude Code subscription supplies the models** (no API
+key, nothing billed per token). See CONTRACT.md §18.
+
+The division of labor per cycle:
+
+- **hype-scout** (`.claude/agents/hype-scout.md`, `model: haiku` — cheap, runs often):
+  polls `market_pulse` (whole Hyperliquid universe in one call: movers, funding
+  extremes, **newly listed perps** via universe diffing) and `social_scan`
+  (deterministic Reddit post velocity via the Arctic Shift mirror, StockTwits
+  bull/bear label tallies, 4chan /biz/ mention counts, CoinGecko trending).
+- **news-reader** (`model: sonnet`): reads `news_feed` (CoinTelegraph + CoinDesk +
+  Google News RSS, deduped, newest first) and opens the few articles that matter,
+  extracting catalysts with direction and freshness.
+- **chart-analyst** (`model: opus`): runs the quant engine (`crypto_screen` /
+  `crypto_decide`) and drills into `derivatives` + `orderflow` (taker buy/sell
+  imbalance, CVD, top-trader-vs-crowd spread, book-depth imbalance, HL-vs-CEX
+  divergence), returning ranked setups with levels.
+- **The host session (your strongest model) is the portfolio manager**: it fuses the
+  three reports, picks the timeframe autonomously (hype -> 5m-15m, technical ->
+  15m-1h, multi-day catalyst -> 4h-1d), manages open positions first, places at most
+  the best risk-gated trade via `paper_trade_decision` (SL/TP attached exchange-side),
+  and journals the cycle. The scout/news/chart agents deliberately have **no trading
+  tools** — only the host can place orders.
+
+Run one cycle in Claude Code (with the MCP server mounted and `MCP_HL_PRIVATE_KEY`
+set): `/trade-swarm` (repo command) or the `trade_swarm` MCP prompt. Loop it:
+`/loop 15m /trade-swarm`. Set a standing objective once with `swarm_goal_set` — every
+future cycle (including scheduled headless ones) reads it back with `swarm_goal_get`.
+
+The engine itself stays **AI-free**: the new scored factors (taker flow, CVD,
+top-trader spread, funding z-score, HL predicted funding, social velocity) are pure
+deterministic computations on keyless data; what the LLM agents *think* only enters
+through the debate/finalize path, never the quant score. The leverage plan's funding
+cost is now Hyperliquid-native (hourly), not the CEX 8h rate.
+
+**PnL is tracked automatically**: every placed order is journaled (JSONL under the
+cache dir) with a client order id, `journal_performance` reconciles decisions against
+actual testnet fills (hit rate, average R, realized PnL per symbol, equity curve), and
+`journal_recent` gives each new cycle the swarm's memory. A **risk gate** runs before
+every order: max 3 same-direction positions (`MCP_SWARM_MAX_POSITIONS`), a daily-loss
+kill-switch (`MCP_SWARM_MAX_DAILY_LOSS_PCT`, default 5% of the UTC-midnight equity),
+and a correlated-exposure cap (BTC-beta buckets, 2x equity, auto-downsizing). Refusals
+come back as `{placed: false, reason}` — the swarm is told to journal them, not fight
+them.
+
+To keep unattended loops from stalling on permission prompts, allow the **read-only**
+swarm tools in your Claude Code settings (keep the `paper_*` write tools prompting
+until you explicitly decide otherwise), e.g. in `.claude/settings.json` →
+`permissions.allow`: `mcp__makecrazypenny__market_pulse`, `orderflow`, `social_scan`,
+`news_feed`, `crypto_decide`, `crypto_evidence`, `crypto_technicals`, `crypto_regime`,
+`crypto_screen`, `derivatives`, `funding_rate`, `paper_pairs`, `paper_account`,
+`paper_orders`, `swarm_goal_get`, `journal_recent`, `journal_performance` (each
+prefixed `mcp__makecrazypenny__`).
+
+> The swarm trades testnet paper money only, and the host model remains the single
+> point of execution. Informational/educational; NOT investment advice.
+
 ## Run the dashboard (Streamlit GUI)
 
 A single-page web dashboard renders everything for one ticker — the `cross_check`

@@ -40,7 +40,9 @@ class CoinGeckoProvider(Provider):
 
     name = _PROVIDER_NAME
     supported = {"crypto_global", "crypto_quote"}
-    rate_per_min = 10  # keyless public tier is 5-15/min; stay conservative
+    # Keyless public tier MEASURED at ~5/min (429 beyond; 2026-06 probe) and the
+    # social_pulse provider's trending call shares the same upstream pool.
+    rate_per_min = 5
     requires_key = None
 
     def __init__(self, settings: "Settings") -> None:

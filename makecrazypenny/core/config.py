@@ -48,6 +48,20 @@ CAPABILITIES: tuple[str, ...] = (
     "long_short_ratio",
     "crypto_sentiment",
     "crypto_global",
+    # --- Swarm extension (CONTRACT.md §18) ---------------------------------
+    # Keyless Hyperliquid info reads (market data only; the signed testnet
+    # write path of §17 is untouched), Binance taker-flow extras, and the
+    # deterministic social/news feeds the trading swarm polls.
+    "hl_asset_ctx",
+    "hl_predicted_funding",
+    "hl_l2book",
+    "hl_funding_history",
+    "hl_market_pulse",
+    "taker_flow",
+    "top_trader_ratio",
+    "funding_history",
+    "social_scan",
+    "news_feed",
 )
 
 CAPABILITY_CHAINS: dict[str, list[str]] = {
@@ -72,6 +86,19 @@ CAPABILITY_CHAINS: dict[str, list[str]] = {
     "long_short_ratio": ["binance", "bybit"],
     "crypto_sentiment": ["fear_greed"],
     "crypto_global": ["coingecko"],
+    # --- Swarm extension (CONTRACT.md §18). Single-provider chains: the
+    # registry tolerates AllProvidersFailed and the dossier carries _error
+    # markers, so a missing source degrades instead of breaking a decision. ---
+    "hl_asset_ctx": ["hyperliquid_info"],
+    "hl_predicted_funding": ["hyperliquid_info"],
+    "hl_l2book": ["hyperliquid_info"],
+    "hl_funding_history": ["hyperliquid_info"],
+    "hl_market_pulse": ["hyperliquid_info"],
+    "taker_flow": ["binance"],
+    "top_trader_ratio": ["binance"],
+    "funding_history": ["binance"],
+    "social_scan": ["social_pulse"],
+    "news_feed": ["news_rss"],
 }
 
 # Per-capability cache TTLs in seconds (see CONTRACT.md §8.5).
@@ -96,6 +123,21 @@ _DEFAULT_TTLS: dict[str, float] = {
     "long_short_ratio": 300.0,
     "crypto_sentiment": 600.0,
     "crypto_global": 300.0,
+    # Swarm extension: HL ctx/pulse are the live decision inputs (fresh);
+    # the order book is only useful near-live; histories/social move slowly.
+    "hl_asset_ctx": 30.0,
+    "hl_predicted_funding": 60.0,
+    "hl_l2book": 5.0,
+    "hl_funding_history": 300.0,
+    "hl_market_pulse": 30.0,
+    # Taker flow + top-trader positioning are the primary scalp signals: at a
+    # 5m horizon a 300s-old reading is a full bar stale, so they refresh with
+    # the other fast derivatives (funding/OI).
+    "taker_flow": 60.0,
+    "top_trader_ratio": 60.0,
+    "funding_history": 300.0,
+    "social_scan": 120.0,
+    "news_feed": 300.0,
 }
 
 # Fallback TTL for any capability not explicitly listed above.
@@ -194,6 +236,12 @@ class Settings:
     #: Crypto exchange REST base URLs (overridable for proxies / regional mirrors).
     binance_base_url: str = "https://fapi.binance.com"
     bybit_base_url: str = "https://api.bybit.com"
+
+    #: Hyperliquid public info API for keyless, READ-ONLY market-data queries
+    #: (POST ``{"type": ...}``; CONTRACT.md §18). Entirely separate from the
+    #: signed testnet write path below — no key, no signing, and no orders
+    #: ever flow through this URL.
+    hyperliquid_info_url: str = "https://api.hyperliquid.xyz/info"
 
     #: Hyperliquid **testnet** paper-trading (CONTRACT.md §17). This is the only
     #: authenticated, state-mutating path in the toolkit. It is intentionally
@@ -321,6 +369,9 @@ class Settings:
             coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
             binance_base_url=os.environ.get("MCP_BINANCE_BASE_URL") or "https://fapi.binance.com",
             bybit_base_url=os.environ.get("MCP_BYBIT_BASE_URL") or "https://api.bybit.com",
+            hyperliquid_info_url=(
+                os.environ.get("MCP_HL_INFO_URL") or "https://api.hyperliquid.xyz/info"
+            ),
             hyperliquid_testnet_url=(
                 os.environ.get("MCP_HL_TESTNET_URL") or "https://api.hyperliquid-testnet.xyz"
             ),

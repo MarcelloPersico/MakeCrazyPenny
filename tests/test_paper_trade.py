@@ -199,8 +199,32 @@ async def test_available_pairs_delegates(monkeypatch: pytest.MonkeyPatch) -> Non
 
 async def test_manual_wrapper_converts_error_to_dict() -> None:
     class Boom:
+        def account_state(self) -> Any:
+            # Healthy-but-anonymous account: the risk gate evaluates (and
+            # passes) without an address/equity to baseline against.
+            return {"positions": []}
+
         def open_position(self, *a: Any, **k: Any) -> Any:
             raise ExecutionError("no key configured")
 
     res = await pt.open_manual("BTC", "LONG", size=0.01, client=Boom())
     assert "error" in res and "no key" in res["error"]
+
+
+async def test_manual_refuses_ungated_when_account_read_fails() -> None:
+    """A transient account-state failure must fail CLOSED, not place ungated."""
+
+    placed: list[Any] = []
+
+    class FlakyInfo:
+        def account_state(self) -> Any:
+            raise ExecutionError("info endpoint 503")
+
+        def open_position(self, *a: Any, **k: Any) -> Any:
+            placed.append(a)
+            return {"status": "ok", "result": {"statuses": [{"filled": {"oid": 1}}]}}
+
+    res = await pt.open_manual("BTC", "LONG", notional_usd=50, client=FlakyInfo())
+    assert res["placed"] is False
+    assert "could not reach" in res["reason"]
+    assert placed == []

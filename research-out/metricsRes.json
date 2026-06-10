@@ -1,0 +1,167 @@
+{
+  "metrics": [
+    {
+      "name": "Taker buy/sell imbalance + CVD (cumulative volume delta)",
+      "computation": "Per kline: takerBuy = field[9] (taker buy base-asset volume), takerSell = volume - takerBuy, delta_t = 2*takerBuy_t - volume_t. Rolling imbalance = sum(delta, N bars)/sum(volume, N bars) in [-1,1]; score = clamp(imbalance/0.2, -1, 1). CVD_t = cumsum(delta); divergence flag: price makes N-bar high/low while CVD does not (fade/exhaustion). Cross-check with /futures/data/takerlongshortRatio buySellRatio r: imbalance = (r-1)/(r+1) per 5m..1d period.",
+      "data_needed": "Futures klines with taker-buy volume field; optionally the aggregated taker long/short ratio series (period 5m-1d, limit<=500).",
+      "free_source": "ALREADY-IN-REPO for the core: binance.py already fetches /fapi/v1/klines but parses only fields 0-5 \u2014 extend the parser to field 9 (zero extra HTTP calls). Optional new endpoint: /futures/data/takerlongshortRatio (keyless). Bybit fallback klines lack taker volume \u2014 degrade gracefully.",
+      "edge_rationale": "Strongest-evidenced addition. Academic: Cont/Kukanov/Stoikov 'The Price Impact of Order Book Events' (arxiv 1011.6402) shows order-flow imbalance is a linear, stronger driver of short-horizon price changes than standard trade measures; crypto LOB/flow studies (e.g. CNN-on-BTC order flow) find clear short/mid-term predictability. Practitioner: CVD-vs-price divergence is the standard absorption/exhaustion read on perps (Coinglass, Bookmap, CryptoQuant taker CVD). Fills a real gap: the engine currently has zero aggressor-flow input \u2014 funding/OI/L+S are positioning, not flow.",
+      "horizon": "Minutes to a few hours for the imbalance score; 1h-1d for CVD divergence.",
+      "priority": "must-have"
+    },
+    {
+      "name": "Top-trader vs crowd positioning spread",
+      "computation": "r_top = topLongShortPositionRatio (top 20% accounts by margin, position-weighted); r_global = globalLongShortAccountRatio (already fetched). spread = ln(r_top) - ln(r_global); score = clamp(spread/ln(2), -1, 1) \u2014 follow smart money, fade crowd. Secondary: d(r_top)/dt over 4-8 periods as smart-money flow; r_top extreme z>2 on its own history damps the contrarian crowd signal (informed crowding is not fadeable like retail crowding).",
+      "data_needed": "Top-trader position ratio history (period 5m-1d) alongside the existing global account ratio.",
+      "free_source": "New keyless endpoints on the existing Binance provider: /futures/data/topLongShortPositionRatio and /futures/data/topLongShortAccountRatio. No Bybit equivalent (its account-ratio is global only).",
+      "edge_rationale": "The engine currently fades the global account ratio, but that series mixes informed and retail accounts. Binance's own docs and practitioner analyses (Binance Square, Coinglass TopTrader, working bots on the positions ratio) treat top-20%-by-margin positioning as the informed leg; the log-spread isolates informed-vs-retail divergence \u2014 the same logic as COT commercial-vs-speculator spreads in futures research. Cheap (same API family) and directly upgrades an existing factor rather than adding a correlated duplicate.",
+      "horizon": "Hours to days.",
+      "priority": "must-have"
+    },
+    {
+      "name": "Funding momentum + z-score extremes",
+      "computation": "Pull last N=90 settlements from /fapi/v1/fundingRate. z = (f_now - mean_N)/std_N; momentum = f_now - SMA_8(f). Signals: |z| >= 2 adds a contrarian kicker on top of the existing level signal (per-symbol regime-relative crowding); 3+ consecutive settlements flipping sign across the +0.01%/8h baseline = squeeze-setup flag; extreme z AND rising OI = cascade-fuel condition (feeds metric below).",
+      "data_needed": "Funding-rate settlement history per symbol (the engine has only the current rate).",
+      "free_source": "New keyless endpoint /fapi/v1/fundingRate (limit<=1000) on the existing Binance provider; Hyperliquid fundingHistory (info API, SDK already a dependency) as fallback.",
+      "edge_rationale": "BIS WP No. 1087 'Crypto carry' shows perp carry is large, time-varying, and that high carry predicts deleveraging crashes; SSRN 'Predictability of Funding Rates' (Inan) shows funding has strong autoregressive structure \u2014 so deviations from a symbol's own recent distribution are informative beyond the fixed-baseline level signal already in crypto_metrics.py (alts have structurally different funding regimes; a fixed annualized baseline mis-scores them). The 170-predictor crypto cross-section literature puts basis/funding among the significant short-horizon predictors.",
+      "horizon": "8h to 3 days.",
+      "priority": "must-have"
+    },
+    {
+      "name": "Predicted-funding divergence + cross-venue funding spread",
+      "computation": "POST /info {\"type\":\"predictedFundings\"} on Hyperliquid returns next-interval predicted rates per coin per venue (HlPerp, BinPerp, BybitPerp). (a) flip/compression: delta = predicted_HL - current_HL; if funding is extreme but predicted to compress toward baseline, decay the contrarian funding score (the squeeze is already resolving). (b) venue spread = predicted_Bin - predicted_HL; |spread| z>2 flags venue-localized positioning and predicts convergence flow toward the cheap venue.",
+      "data_needed": "Hyperliquid predicted fundings (1h interval) + current funding (already fetched from Binance).",
+      "free_source": "Hyperliquid info API, keyless \u2014 the hyperliquid-python-sdk Info client is already wired in execution/hyperliquid.py; expose a read-only provider capability.",
+      "edge_rationale": "Practitioner evidence (Chainstack/Chainspot/OneKey funding-arb guides): HL's 1h funding updates front-run 8h CEX funding shifts by 15-30 minutes, and current-vs-predicted divergence indicates whether crowding is building or compressing \u2014 making the existing funding signal forward-looking instead of stale-by-up-to-8h. Directly relevant since execution happens on HL: the venue's own funding is what the position actually pays.",
+      "horizon": "Minutes to hours.",
+      "priority": "high"
+    },
+    {
+      "name": "Orderbook depth imbalance at 10/25/50 bps (entry-timing gate)",
+      "computation": "GET /fapi/v1/depth?limit=1000 (or HL l2Book). For band b: B_b = sum bid qty within b bps of mid, A_b = same for asks; imb_b = (B_b - A_b)/(B_b + A_b). Composite = 0.5*imb_10 + 0.3*imb_25 + 0.2*imb_50. Use as an execution gate, NOT in the slow score: require sign(imb) agrees with trade direction at order time, else delay/downsize. Side metric: total depth within 50bps vs its 30-snapshot median = thin-book veto.",
+      "data_needed": "One depth snapshot at decision/execution time per symbol.",
+      "free_source": "Binance /fapi/v1/depth (keyless, existing provider); Hyperliquid l2Book via the in-repo SDK Info client (matches the venue actually traded).",
+      "edge_rationale": "Deepest academic literature of any candidate: Cont et al. and the OFI literature establish book imbalance as the dominant predictor of next-move direction at second-to-minute horizons; crypto deep-LOB studies replicate it on BTC. But the signal decays in seconds-minutes, so for a minutes-cadence engine it belongs at the execution layer (avoid market-buying into a stacked ask) rather than the scoring layer. Cheap and reduces slippage on every paper_open.",
+      "horizon": "Seconds to minutes (strongest); use at order placement.",
+      "priority": "high"
+    },
+    {
+      "name": "Realized-vol regime via Parkinson/Yang-Zhang (replaces close-to-close vol everywhere)",
+      "computation": "Parkinson: sigma_P = sqrt( (1/(4 ln2 * N)) * sum ln(H_i/L_i)^2 ) * sqrt(bars_per_year). Crypto is 24/7 (no gaps) so Parkinson/Garman-Klass capture YZ's benefit; YZ optional. Regime ratio R = sigma_P(7d of 1h bars)/sigma_P(30d): R>1.5 = expansion (cut leverage, widen stops, prefer breakout logic); R<0.7 = compression (squeeze-watch). Feed sigma_P into risk.py position_sizing in place of close-to-close annual_vol.",
+      "data_needed": "OHLC bars only.",
+      "free_source": "ALREADY-IN-REPO \u2014 pure computation on klines already fetched from Binance/Bybit.",
+      "edge_rationale": "Parkinson is ~5x and YZ ~8-14x more statistically efficient than close-to-close (FlashAlpha/Quantreo estimator literature; Yang-Zhang 2000), meaning a 5-10 day window gives a stable estimate \u2014 much faster regime response for sizing. Payoff is via sizing: vol targeting demonstrably raises Sharpe for momentum (Moreira-Muir line; conditional vol targeting; crypto-specific: risk-managed crypto momentum lifts weekly SR 1.12 -> 1.42, Finance Research Letters 2025). For leveraged perps, sizing error is the dominant failure mode, so this outranks most directional signals.",
+      "horizon": "Sizing benefit at all horizons; regime ratio most useful at hours-to-weeks.",
+      "priority": "must-have"
+    },
+    {
+      "name": "Volume z-score / relative volume (RVOL) confirmation gate",
+      "computation": "On log volume: z = (ln v_t - mean_100)/std_100 per interval; RVOL = v_t/SMA_20(v same interval). Gate: momentum/breakout entries require z>=2 or RVOL>=1.5; OI-confirmed price moves on RVOL<1 get the oi_price_signal magnitude haircut (thin-participation move). Interacts with CVD: delta on high RVOL is weighted up.",
+      "data_needed": "Kline volumes only.",
+      "free_source": "ALREADY-IN-REPO \u2014 klines.",
+      "edge_rationale": "Practitioner-consensus breakout filter: breakouts on >=1.5x relative volume hold materially more often, thin-volume breakouts fail (Bitsgap/Hyrotrader guides; standard in equity intraday literature). Weak as standalone alpha but strong as a false-signal reducer for the existing momentum and OI-price blocks, at zero data cost.",
+      "horizon": "Minutes to hours.",
+      "priority": "high"
+    },
+    {
+      "name": "Cross-exchange price divergence (Hyperliquid mid vs Binance mark)",
+      "computation": "div_bps = 1e4 * (HL_allMids[coin] - Binance markPrice)/Binance markPrice. Maintain rolling mean/std per symbol; |z|>2 (typically >10-15bps on majors) = venue-localized flow: expect convergence within minutes; as execution guard, never market-enter on the rich side of the divergence, and treat persistent signed divergence + funding venue spread as squeeze-side evidence.",
+      "data_needed": "HL mids + Binance mark price, both already fetched.",
+      "free_source": "ALREADY-IN-REPO \u2014 Info.all_mids() (execution/hyperliquid.py) and /fapi/v1/premiumIndex markPrice (binance.py). Pure combination.",
+      "edge_rationale": "Cross-venue price-discovery/lead-lag literature and HL-vs-CEX basis-trading practice (Chainspot) show divergences mean-revert in minutes via arb; for this system it is doubly valuable because execution is on HL while signals are computed from Binance \u2014 it is simultaneously a microstructure signal and a data-sanity/slippage check before paper_open.",
+      "horizon": "Minutes.",
+      "priority": "high"
+    },
+    {
+      "name": "Liquidation-proximity / cascade-fuel estimate",
+      "computation": "v1 (cheap): leverage-stress = OI_value / 24h quote volume; fragile when stress is top-quintile vs 30d AND |funding z|>=2 \u2014 cut size, tighten invalidations. v2 (cluster map): take top-decile delta-OI bars from openInterestHist as entry-price clusters P_c with weight = OI added; estimated liq bands per tier L in {10,25,50,100}: P_c*(1 - 1/L + mmr) for longs (mirror for shorts) using leverage.py's liquidation_price; cascade-fuel score = signed sum of cluster weights whose band lies within 2*ATR of price (long-liq clusters just below price = downside magnet/acceleration risk).",
+      "data_needed": "OI history (have it), klines/ATR (have it), maintenance-margin approximation (leverage.py has it). No paid liquidation feed needed.",
+      "free_source": "ALREADY-IN-REPO inputs (Binance /futures/data/openInterestHist + klines). Note: Binance REST liquidation history was discontinued \u2014 live prints are only on the !forceOrder WS stream; Coinglass heatmaps are paywalled, hence the estimate.",
+      "edge_rationale": "Cascade post-mortems (Oct 2025 ~$19B, Nov 2025 ~$2B events) consistently show record OI + extreme funding precede amplified moves; OI is 'stored energy' \u2014 it does not give direction but multiplies impact, which is exactly what a leverage-sizing engine must price. Practitioner 'magnetic zones' (Coinglass methodology docs) formalize price gravitating to dense liq clusters. Use as risk gate + magnet-direction tiebreaker, not standalone alpha.",
+      "horizon": "Hours to days; risk gate at all times.",
+      "priority": "high"
+    },
+    {
+      "name": "Basis term structure (quarterly vs perp, BTC/ETH only)",
+      "computation": "Discover dated symbols (BTCUSDT_YYMMDD) via /fapi/v1/exchangeInfo; annualized basis b = (F/S_index - 1)*365/DTE per expiry; slope = b_far - b_near; compare with funding-implied carry. Steep contango + funding z>2 = aggressive leveraged demand (crash-risk flag, scale gross down); inverted/negative basis = capitulation (contrarian bullish on a days horizon).",
+      "data_needed": "Quarterly futures marks + index, perp funding (have funding).",
+      "free_source": "Binance fapi delivery-contract tickers/premiumIndex, keyless, same provider. Only BTC/ETH quarterlies are liquid \u2014 treat as a market-regime input next to the existing BTC regime, not per-alt.",
+      "edge_rationale": "BIS WP 1087 'Crypto carry': crypto basis is huge and time-varying, high carry reflects speculative leveraged demand and precedes deleveraging crashes \u2014 the term structure is the slower, cleaner cousin of funding and is not mechanically identical to the perp premium the repo already declines to double-count. Slow signal; modest incremental value over funding z-score.",
+      "horizon": "Days to weeks.",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "Hurst exponent trend-vs-chop weight modulator",
+      "computation": "DFA or aggregated-variance Hurst H on last 200-500 1h log returns (or cheaper variance-ratio statistic with the same intent). H>0.55: multiply momentum-block weights by ~1.25 and halve contrarian weights; H<0.45: the reverse; 0.45-0.55: neutral. Recompute daily; never use as a directional signal.",
+      "data_needed": "Return series from klines.",
+      "free_source": "ALREADY-IN-REPO \u2014 klines.",
+      "edge_rationale": "BTC Hurst studies (arxiv 1804.05916, regime analyses by Samara/Harbourfront) document persistent H~0.6+ phases in trending bulls vs ~0.5 efficient phases, supporting momentum-weight modulation; but the literature is equally clear it is lagging (detects regime several bars late) and the existing ADX/multi-TF trend stack already proxies much of it. Marginal, cheap.",
+      "horizon": "Days (regime classification).",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "Session VWAP deviation",
+      "computation": "Anchored at 00:00 UTC (and rolling 24h variant): VWAP = sum(typical_price*vol)/sum(vol); dev_z = (P - VWAP)/std(P - VWAP, session). In chop (low ADX or Hurst<0.5): |dev_z|>2 = fade-to-VWAP signal; in trend: price holding above VWAP = trend-health confirmation; also the natural limit-entry anchor for the execution layer.",
+      "data_needed": "Klines.",
+      "free_source": "ALREADY-IN-REPO \u2014 klines.",
+      "edge_rationale": "Practitioner-standard institutional benchmark; the academic support is indirect \u2014 crypto intraday reversal is documented (NAJEF 'Intraday return predictability in cryptocurrency markets: momentum, reversal, or both', covering BTC/ETH/LTC/XRP), and VWAP reversion is the tradable expression \u2014 but standalone alpha evidence is thin. Best as entry-price discipline for the paper-trade layer.",
+      "horizon": "Intraday (hours).",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "BTC-dominance shift + alt-season breadth gate",
+      "computation": "From CoinGecko: dominance delta over 24h/7d (crypto_global, already fetched); breadth = share of top-50 non-stablecoin coins with 24h return > BTC 24h return via /coins/markets?price_change_percentage=24h (one extra call). Gate for ALT trades only: breadth<35% AND dominance rising -> veto/halve alt longs; breadth>65% AND dominance falling -> small tailwind bump and allow more alt slots in crypto_screen.",
+      "data_needed": "Global dominance (have), top-50 24h changes (one new call).",
+      "free_source": "ALREADY-IN-REPO (CoinGecko /global) + new keyless CoinGecko /coins/markets on the existing provider.",
+      "edge_rationale": "Alt-season index methodology (CoinMarketCap/Blockchaincenter 75%-of-top-50 rule) is explicitly a confirmation tool, and practitioner consensus is that alt longs systematically underperform while dominance rises \u2014 i.e. this earns its keep as a cross-sectional risk gate for the screener, not as per-trade alpha. The 90d window is too slow; use 24h/7d breadth for a days-horizon gate.",
+      "horizon": "Days (alt-selection gate).",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "Coinbase premium (US spot demand)",
+      "computation": "prem = CoinbaseExchange BTC-USD last / Binance spot BTCUSDT last - 1 (api.exchange.coinbase.com/products/BTC-USD/ticker, keyless). EMA-smooth; signal only on sign flips and |z|>2 vs 30d, not on level. Kimchi premium variant requires KRW FX + Upbit \u2014 skip (extra dependency, US-side signal is the cleaner free one).",
+      "data_needed": "Two spot tickers.",
+      "free_source": "New keyless Coinbase Exchange public ticker + Binance spot api/v3 ticker (trivial additions).",
+      "edge_rationale": "CryptoQuant/CryptoSlate analyses: premium directional flips cluster around turning points (US institutional/spot bid appearing or vanishing), while the level alone predicts little; kimchi premium front-running evidence is mixed post-2021. A BTC-regime tiebreaker at the days horizon, clearly behind the derivatives-native signals for a perp engine.",
+      "horizon": "Days.",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "Stablecoin dry-powder delta",
+      "computation": "7d delta of (USDT + USDC) market cap from CoinGecko /coins/markets?ids=tether,usd-coin; z-score vs 90d. Rising issuance = exchange-side buying-power tailwind for the BTC regime block; shrinking = de-risking headwind.",
+      "data_needed": "Two market caps, daily.",
+      "free_source": "New keyless CoinGecko call on the existing provider.",
+      "edge_rationale": "Weakest evidence of the set at this horizon: Wei (2018) finds no Tether-issuance impact on BTC returns; Ante et al. (2021) find abnormal returns around issuances; the documented intraday minting pop (5-30 min, Finance Research Letters Tether-minting study) is not capturable from free daily-granularity data. Keep as a slow regime tilt only.",
+      "horizon": "Days to weeks.",
+      "priority": "nice-to-have"
+    },
+    {
+      "name": "RISK: Max-correlated-exposure guard (portfolio-level)",
+      "computation": "Rolling 30d correlation/beta of each held+candidate symbol vs BTC and ETH from daily (or 4h) kline returns: beta_i = cov(r_i, r_BTC)/var(r_BTC). Cluster anything with corr>0.7 into the BTC-beta bucket (in stress that is nearly every alt). Guards at order time: (1) sum |notional_i * beta_i| <= cap (e.g. 2x equity); (2) same-direction position count cap; (3) new paper_trade_decision orders that breach the cap are auto-downsized to fit, with the reason logged.",
+      "data_needed": "Klines (have) + current positions from paper_account (have).",
+      "free_source": "ALREADY-IN-REPO inputs; pure computation in analysis/risk.py + a check in orchestration/paper_trade.py. Nothing like it exists today (portfolio.py scales gross by regime but has no cross-asset correlation logic).",
+      "edge_rationale": "Crypto pairwise correlations to BTC run 0.7-0.9 normally and spike toward 1 in liquidation cascades (every cascade post-mortem; Oct/Nov 2025 events) \u2014 three 'independent' 5x alt longs are one 15x BTC long in the state of the world where it matters. This is the standard institutional control whose absence most directly threatens a leveraged multi-position book.",
+      "horizon": "All horizons (order-time gate).",
+      "priority": "must-have"
+    },
+    {
+      "name": "RISK: Kelly estimation haircut calibrated to realized hit-rate",
+      "computation": "risk.py already does conviction->p->half-Kelly. Additions: (1) shrink the empirical journal hit-rate with a Laplace/Wilson prior: p_hat = (wins+2)/(n+4); (2) use p_eff = min(conviction-implied p, p_hat) in kelly_fraction_from_conviction; (3) drop DEFAULT_KELLY_FRACTION to 0.25-0.33 until n>=50 closed paper trades, then allow 0.5.",
+      "data_needed": "Closed-trade journal (paper-trade fills already retrievable via recent_fills).",
+      "free_source": "ALREADY-IN-REPO (half-Kelly exists in analysis/risk.py; fills via execution layer) \u2014 this is a calibration upgrade, not new data.",
+      "edge_rationale": "Kelly literature is unambiguous: estimation error is the failure mode \u2014 Benter reports good models overestimate edge ~2x (an intended full-Kelly bet becomes 2x-Kelly, zero growth); Thorp/MacLean-Ziemba show half-Kelly keeps ~75% of growth with drastically lower drawdown, and full Kelly carries ~1/3 chance of a 50% drawdown. With leverage on top, anchoring p to realized (shrunk) hit-rate instead of model conviction is the single best ruin-avoidance refinement available for free.",
+      "horizon": "All horizons (sizing).",
+      "priority": "high"
+    },
+    {
+      "name": "RISK: Per-asset vol-targeted notional with expansion auto-deleverage",
+      "computation": "Upgrade existing position_sizing: (1) annual_vol input = Parkinson/YZ sigma (7-10d window) instead of close-to-close; (2) per-asset target vol (e.g. 0.40 ann for BTC/ETH exposure, lower notional automatically for 2x-vol alts via the same formula); (3) auto-deleverage flag: if sigma_7d/sigma_30d > 1.5 while a position is open, emit a reduce-to-target advisory in paper_account monitoring.",
+      "data_needed": "OHLC bars (have), open positions (have).",
+      "free_source": "ALREADY-IN-REPO \u2014 refinement of analysis/risk.py + analysis/leverage.py; no new data.",
+      "edge_rationale": "Vol targeting reliably improves Sharpe for momentum-style books (Man Group/AlphaArchitect/conditional-vol-targeting literature) and the crypto-specific result is strong: risk-managed crypto momentum lifts annualized Sharpe 1.12 -> 1.42 with returns, not just smaller drawdowns (Finance Research Letters 2025). The efficient estimator (above) is what makes the response fast enough for a leveraged minutes-to-days book.",
+      "horizon": "All horizons (sizing); expansion flag acts within hours.",
+      "priority": "must-have"
+    }
+  ],
+  "summary": "Researched practitioner + academic evidence for short-horizon leveraged perp metrics and mapped each candidate onto the repo's existing free-data plumbing (C:\\Users\\persi\\Desktop\\MCPenny\\makecrazypenny\\providers\\binance.py, bybit.py, coingecko.py, fear_greed.py; HL SDK Info client in execution\\hyperliquid.py; sizing in analysis\\risk.py and analysis\\leverage.py).\n\nHeadline findings: (1) The engine's biggest signal gap is aggressor FLOW \u2014 it has positioning (funding/OI/L-S) but no taker flow; CVD/taker imbalance is the best-evidenced addition (Cont-Kukanov-Stoikov OFI price-impact literature + universal practitioner use) and is nearly free because binance.py already downloads klines but discards field 9 (taker buy volume) \u2014 a parser extension, zero new HTTP calls. (2) Three more derivatives-native must/high adds reuse the same Binance provider with new keyless paths: top-trader-vs-crowd log-spread (topLongShortPositionRatio vs the global ratio already fetched), funding z-score/momentum from /fapi/v1/fundingRate history (BIS 'Crypto carry' WP1087: high carry predicts deleveraging crashes), and HL predictedFundings for funding-flip/venue-spread (HL's 1h funding front-runs 8h CEX funding). (3) Several high-value items are pure computation on data already fetched: Parkinson/Yang-Zhang realized-vol regime (5-14x estimator efficiency; feeds vol targeting, which lifts crypto momentum Sharpe 1.12->1.42 in the literature), volume z-score gate, HL-vs-Binance price divergence (doubles as execution sanity check), and a liquidation cascade-fuel estimate from OI-history clusters + leverage.py's liquidation model (free substitute for paywalled heatmaps; OI is impact-amplifying, not directional). (4) Orderbook depth imbalance has the strongest academic support but decays in seconds-minutes \u2014 implement it as an order-time entry gate, not a scoring factor. (5) Risk: half-Kelly and vol-target sizing already exist in risk.py; the genuinely missing control is a max-correlated-exposure guard (crypto correlations spike toward 1 exactly during cascades), plus calibrating Kelly's p to shrunk realized hit-rate (Benter: models overestimate edge ~2x) and switching the vol input to the efficient estimator. Nice-to-haves (slower/weaker evidence): BTC/ETH quarterly basis term structure, Hurst weight-modulator, VWAP deviation, dominance/breadth alt-gate, Coinbase premium flips, stablecoin dry-powder (evidence mixed: Wei 2018 null vs Ante 2021 abnormal returns).\n\nKey sources: arxiv.org/pdf/1011.6402 (OFI price impact); bis.org/publ/work1087.pdf (Crypto carry); papers.ssrn.com/sol3/papers.cfm?abstract_id=5576424 (funding predictability); sciencedirect.com/science/article/abs/pii/S1062940822000833 (crypto intraday momentum/reversal); sciencedirect.com/science/article/abs/pii/S1544612325011377 (risk-managed crypto momentum SR 1.12->1.42); developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Top-Trader-Long-Short-Ratio; hyperliquid.gitbook.io perpetuals info endpoint + quicknode.com/docs/hyperliquid/info-endpoints/predictedFundings; coinglass.com/learn/how-to-use-liqmap-to-assist-trading-en (magnetic zones); en.wikipedia.org/wiki/Kelly_criterion + capitalideasonline half-Kelly (Benter/Thorp estimation error); flashalpha.com Yang-Zhang estimator efficiency; tandfonline.com/doi/full/10.1080/0015198X.2020.1790853 (conditional vol targeting)."
+}

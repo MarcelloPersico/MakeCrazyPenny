@@ -27,6 +27,11 @@ _SCRUBBED_ENV_VARS = (
     "MCP_HL_ACCOUNT_ADDRESS",
     "MCP_HL_TESTNET_URL",
     "MCP_HL_SLIPPAGE",
+    # Swarm extension (CONTRACT.md §18): info-URL override + risk-gate knobs.
+    "MCP_HL_INFO_URL",
+    "MCP_SWARM_RISK_GATE",
+    "MCP_SWARM_MAX_POSITIONS",
+    "MCP_SWARM_MAX_DAILY_LOSS_PCT",
 )
 
 

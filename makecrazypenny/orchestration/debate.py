@@ -530,7 +530,11 @@ def _quant_conviction(scored: dict[str, Any]) -> float:
     net = float(scored.get("net_score", 0.0))
     engagement = bull + bear
     raw = abs(net) / engagement if engagement > 1e-9 else 0.0
-    coverage = _clamp(len(scored.get("categories", [])) / 4.0, 0.0, 1.0)
+    # The scorer may carry its own coverage norm (the crypto engine scores more
+    # independent categories, so it demands broader coverage for the same
+    # conviction); the default of 4 preserves the equity behavior exactly.
+    norm = float(scored.get("category_norm", 4.0)) or 4.0
+    coverage = _clamp(len(scored.get("categories", [])) / norm, 0.0, 1.0)
     penalty = float(scored.get("divergence_penalty", 0.0))
     return round(_clamp(raw * coverage * (1.0 - 0.3 * penalty), 0.0, 1.0), 4)
 
@@ -556,8 +560,12 @@ def _quant_decision(scored: dict[str, Any]) -> dict[str, Any]:
     net = float(scored.get("net_score", 0.0))
     conviction = _quant_conviction(scored)
     n_categories = len(scored.get("categories", []))
-    strong = abs(net) >= 2.0 * _LONG_THRESHOLD
-    corroborated = n_categories >= 2 or strong
+    # Corroboration tuning may ride in the scored dict (see _quant_conviction);
+    # the defaults preserve the equity behavior exactly.
+    min_categories = int(scored.get("corroboration_min_categories", 2))
+    strong_mult = float(scored.get("strong_net_mult", 2.0)) or 2.0
+    strong = abs(net) >= strong_mult * _LONG_THRESHOLD
+    corroborated = n_categories >= min_categories or strong
 
     below_threshold = -_SHORT_THRESHOLD < net < _LONG_THRESHOLD
     if conviction < _MIN_CONVICTION or below_threshold or not corroborated:
@@ -670,7 +678,14 @@ def decide_from_scores(
         "categories_covered": scored.get("categories", []),
         "n_factors": scored.get("n_factors", 0),
         "divergence_penalty": scored.get("divergence_penalty", 0.0),
-        "coverage": round(_clamp(len(scored.get("categories", [])) / 4.0, 0.0, 1.0), 4),
+        "coverage": round(
+            _clamp(
+                len(scored.get("categories", [])) / (float(scored.get("category_norm", 4.0)) or 4.0),
+                0.0,
+                1.0,
+            ),
+            4,
+        ),
     }
 
     return TradeDecision(

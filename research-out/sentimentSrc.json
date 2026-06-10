@@ -1,0 +1,216 @@
+{
+  "sources": [
+    {
+      "name": "Reddit public JSON (www.reddit.com)",
+      "category": "social-sentiment",
+      "endpoint": "https://www.reddit.com/r/{sub}/new.json?limit=100&raw_json=1 ; search: https://www.reddit.com/r/{sub}/search.json?q={term}&restrict_sr=1&sort=new&t=hour",
+      "method": "GET",
+      "auth": "none",
+      "verified": false,
+      "rate_limit": "Docs/policy: ~10 req/min unauthenticated (per-IP, needs unique descriptive User-Agent); 100 req/min with free OAuth script app (free-key fallback). Headers x-ratelimit-remaining/used/reset when not blocked.",
+      "notes": "COULD NOT VERIFY FROM THIS MACHINE: every variant returned 403 'Blocked' (www.reddit.com, old.reddit.com, api.reddit.com, /new/.rss; both bot-style and Chrome User-Agents; WebFetch also refused the domain). This egress IP resolves to an AMS datacenter (CF-RAY a094b2*-AMS) and Reddit hard-blocks datacenter IPs regardless of UA. From a residential IP the same URLs typically work keyless, but DO NOT build on this from this box \u2014 use Arctic Shift (verified below) or a free OAuth app. search.json keyless: unverifiable here for the same reason. Subreddits that matter: r/CryptoCurrency (high volume, fresh), r/CryptoMarkets (trader-skewed), r/solana (memecoin/perp beta flow), r/CryptoMoonShots + r/SatoshiStreetBets (new-coin hype, very noisy), coin-specific subs (r/ethtrader, r/dogecoin). r/Hyperliquid is effectively DEAD/restricted: Arctic Shift archive shows its newest post is >2 years old and the main sub does not appear in subreddit prefix search (only tiny clones like 'hyperliquid1', 381 subs). Hyperliquid chatter lives on X/Discord, not Reddit.",
+      "value_for_decisions": "Post velocity per ticker (count of new posts/hour mentioning a symbol vs trailing baseline) and crude polarity from title keywords + upvote ratio. New-listing hype shows up in r/CryptoMoonShots first. Swarm pattern (if unblocked/OAuth): one cheap model per subreddit polling new.json every 60-120s, dedupe by post id (t3_*), emit (symbol, mentions_1h, z-score)."
+    },
+    {
+      "name": "Arctic Shift (Reddit mirror, real-time)",
+      "category": "social-sentiment",
+      "endpoint": "https://arctic-shift.photon-reddit.com/api/posts/search?subreddit={sub}&limit=100&sort=desc ; comments: https://arctic-shift.photon-reddit.com/api/comments/search?subreddit={sub}&limit=100&sort=desc ; also supports query=, after=, before= (epoch) params",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Live headers: X-Ratelimit-Scope: global, X-Ratelimit-Remaining: 999, X-Ratelimit-Reset: 1 (i.e. ~1000-req budget refreshing every second-scale window \u2014 extremely generous). Be polite anyway; it's a volunteer-run archive.",
+      "sample_response_snippet": "{\"data\":[{\"_meta\":{\"note\":\"no_2nd_retrieval\"},\"all_awardings\":[],\"allow_live_comments\":false,\"approved_at_utc\":null,\"approved_by\":null,\"archived\":false,\"author\":\"Cool-Art-9018\",\"author_flair_background_color\":null,\"author_flair_css_class\":null,...\"title\":\"...\",\"created_utc\":...,\"subreddit\":\"CryptoCurrency\"}]}",
+      "value_for_decisions": "THE working keyless Reddit feed from this machine. Verified FRESH: newest r/CryptoCurrency posts were 6-18 minutes old; r/solana 12 min; r/CryptoMarkets ~4-5h (sub is slower). Full Reddit post/comment schema (title, selftext, score, created_utc, num_comments) so you get mention velocity AND material for cheap-model polarity classification. Comments endpoint verified too \u2014 comment velocity is a faster hype signal than posts. Swarm: one poller per sub every 60s with after={last_seen_epoch}, fan post titles+bodies to a fast model for {symbol, bullish/bearish/neutral} extraction, aggregate z-scores. Caveat: small/new subs may have ingest gaps (r/Hyperliquid archive is stale because the sub itself is dead)."
+    },
+    {
+      "name": "PullPush (Reddit mirror)",
+      "category": "social-sentiment",
+      "endpoint": "https://api.pullpush.io/reddit/search/submission/?subreddit={sub}&size=100&sort=desc",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Docs: soft limit ~15 req/min.",
+      "sample_response_snippet": "{\"data\":[{\"_meta\":{\"retrieved_2nd_on\":1747789416},\"all_awardings\":[],\"allow_live_comments\":false,\"approved_at_utc\":null,\"approved_by\":null,\"archived\":false,\"author\":\"Accomplished-Hawk920\",\"author_flair_background_color\":null,...}]}",
+      "value_for_decisions": "Returns 200 with valid Reddit schema BUT data is ~13 MONTHS STALE (newest r/CryptoCurrency post was 9,277 hours old). Useless for live velocity \u2014 listed only so the swarm doesn't waste time on it. Use Arctic Shift instead. Could serve as historical baseline corpus for calibrating mention z-scores."
+    },
+    {
+      "name": "CoinGecko /search/trending",
+      "category": "hype/new-coin-discovery",
+      "endpoint": "https://api.coingecko.com/api/v3/search/trending",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "MEASURED LIVE: 5 rapid keyless calls returned 200, calls 6-8 returned 429 (so ~5/min sustained keyless; docs say 5-15/min shared public pool). Free Demo key (free signup): 30 calls/min, 10,000 calls/month via x-cg-demo-api-key header. Response cached 30-600s (Cache-Control: max-age=30, s-maxage=600).",
+      "sample_response_snippet": "{\"coins\": [{\"item\":{\"id\":\"humanity\",\"coin_id\":66811,\"name\":\"Humanity\",\"symbol\":\"H\",\"market_cap_rank\":134,\"thumb\":\"https://coin-images.coingecko.com/coins/images/66811/standard/H_tokenLogo_original.png?1750581252\",...\"price_btc\":2.640179334504181e-06,\"score\":0,\"data\":{\"price\":0.1631928877883755,...",
+      "value_for_decisions": "Top-15 most-searched coins (retail attention proxy, ~10-min lag, ordered by score) + trending NFTs/categories. A coin entering this list that is also an HL perp = retail hype confirmation. Swarm: ONE poller every 60-120s (server caches 30s anyway); diff the id set vs previous poll \u2014 a NEW entrant is the event, not the list itself. Keyless budget is tight (~5/min total across ALL CoinGecko endpoints from one IP), so dedicate one poller and share results."
+    },
+    {
+      "name": "CoinGecko /coins/markets",
+      "category": "market-data/screening",
+      "endpoint": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1&price_change_percentage=1h,24h",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Same shared keyless pool as above (~5/min measured before 429). Demo key: 30/min, 10k/month.",
+      "sample_response_snippet": "[{\"id\":\"tether\",\"symbol\":\"usdt\",\"name\":\"Tether\",\"image\":\"https://coin-images.coingecko.com/coins/images/325/large/Tether.png?1696501661\",\"current_price\":0.999311,\"market_cap\":186821794481,\"market_cap_rank\":3,\"fully_diluted_valuation\":192284996113,\"total_volume\":58835991821,\"high_24h\":0.999547,...",
+      "value_for_decisions": "Volume/price-change cross-section for mapping social hype to liquid tradables; 1h price_change_percentage is the fast momentum confirm. Note: /coins/list/new (CoinGecko's actual new-coin list) returned 401 keyless \u2014 it is PAID (Analyst tier), don't plan on it. Use GeckoTerminal new_pools (same company, free) for new-coin discovery instead. Swarm: 1 call/5min refresh of top-250 by volume is plenty."
+    },
+    {
+      "name": "CoinGecko /coins/list/new",
+      "category": "new-coin-discovery",
+      "endpoint": "https://api.coingecko.com/api/v3/coins/list/new",
+      "method": "GET",
+      "auth": "paid",
+      "verified": false,
+      "rate_limit": "n/a keyless",
+      "sample_response_snippet": "HTTP/1.1 401 Unauthorized (verified live: keyless and demo tiers are rejected; Analyst+ paid plan required)",
+      "value_for_decisions": "Would list 200 newest CoinGecko-indexed coins, but it is paywalled \u2014 confirmed 401 live. Substitute: GeckoTerminal /networks/new_pools (verified free, below)."
+    },
+    {
+      "name": "alternative.me Fear & Greed Index",
+      "category": "sentiment-macro",
+      "endpoint": "https://api.alternative.me/fng/?limit=2 (history: ?limit=30&format=json \u2014 also verified 200)",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "None published; data updates once per day (time_until_update field says when). Polling more than ~hourly is pointless.",
+      "sample_response_snippet": "{\"name\":\"Fear and Greed Index\",\"data\":[{\"value\":\"9\",\"value_classification\":\"Extreme Fear\",\"timestamp\":\"1781049600\",\"time_until_update\":\"80077\"},{\"value\":\"10\",\"value_classification\":\"Extreme Fear\",\"timestamp\":\"1780963200\"}],\"metadata\":{\"error\":null}}",
+      "value_for_decisions": "Already in repo \u2014 confirmed working. Daily regime dial (currently 9 = Extreme Fear), not an intraday signal. Swarm: one fetch/day cached; use as a leverage-throttle prior (extreme fear \u2192 reduce size on momentum longs), and the 30-day series for regime deltas."
+    },
+    {
+      "name": "StockTwits public API (crypto symbols)",
+      "category": "social-sentiment",
+      "endpoint": "https://api.stocktwits.com/api/2/streams/symbol/{SYM}.X.json (e.g. BTC.X, HYPE.X \u2014 both verified); trending: https://api.stocktwits.com/api/2/trending/symbols.json",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Docs: 200 req/hour unauthenticated per IP (400/hr with free OAuth token). No rate headers observed on 200s; 429 with JSON error when exceeded.",
+      "sample_response_snippet": "{\"symbol\":{\"id\":33424,\"symbol\":\"HYPE.X\",\"symbol_mic\":\"HYPE.X\",\"symbol_display\":\"HYPE\",\"exchange\":\"CRYPTO\",\"region\":\"X\",\"logo_url\":\"https://logos.stocktwits-cdn.com/HYPE.X.webp\",\"title\":\"Hype\",\"aliases\":[],\"deeplink\":\"coins/hyperliquid\",\"external_id\":\"hyperliquid\",\"is_following\":false,\"watchlist_count\":2514,...\"cursor\":{\"more\":true,\"since\":655950505,\"max\":655769703}",
+      "value_for_decisions": "Best free LABELED sentiment: each message carries entities.sentiment.basic = Bullish/Bearish (user-tagged \u2014 no model needed for polarity), plus watchlist_count and message velocity. HYPE.X exists with 2,514 watchers, so Hyperliquid's own token is covered. Crypto symbols use the .X suffix. trending/symbols.json (verified 200) mixes stocks+crypto \u2014 filter exchange=='CRYPTO'. Swarm: poll watched perp symbols round-robin within the 200/hr budget (e.g. 20 symbols every 8 min using cursor 'since' param for deltas); compute bull/bear ratio and message-rate z-score per symbol."
+    },
+    {
+      "name": "Google Trends via pytrends",
+      "category": "search-attention",
+      "endpoint": "pytrends TrendReq().build_payload(['hyperliquid'], timeframe='now 7-d').interest_over_time() (unofficial scrape of trends.google.com)",
+      "method": "GET",
+      "auth": "none",
+      "verified": false,
+      "rate_limit": "Aggressively bot-detected; no official limit. Needs long backoffs (60s+), cookie warm-up, and residential IP to work at all.",
+      "sample_response_snippet": "Live test from this machine: pytrends.exceptions.TooManyRequestsError: The request failed: Google returned a response with code 429 (first request, fresh session)",
+      "value_for_decisions": "DO NOT build on this. Installed pytrends 4.9.x into the repo venv and tested live: instant 429 on the very first request from this (datacenter-routed) IP. pytrends is also unmaintained (pandas FutureWarnings). If search-attention is wanted later, run it on a residential connection with 1 req/2-5min and treat failures as normal. Signal would be: relative search interest velocity for coin names \u2014 slow (hourly granularity), confirmatory only."
+    },
+    {
+      "name": "LunarCrush",
+      "category": "social-aggregator",
+      "endpoint": "https://lunarcrush.com/api4/public/coins/list/v1",
+      "method": "GET",
+      "auth": "free-key",
+      "verified": false,
+      "rate_limit": "Free 'Individual' plan (signup required): 10 req/min, 2,000/day per their pricing page; v2 keyless API was shut down.",
+      "sample_response_snippet": "HTTP 401 keyless (verified live \u2014 Authorization: Bearer <key> required for every api4 route)",
+      "value_for_decisions": "Confirmed NOT keyless (401). Their Galaxy Score / AltRank / social volume per coin is exactly the aggregate you'd want, so it's a decent free-key FALLBACK if you accept signup, but the free tier is throttled enough that Arctic Shift + StockTwits self-aggregation is the better primary path."
+    },
+    {
+      "name": "Santiment GraphQL (keyless free tier)",
+      "category": "social-aggregator",
+      "endpoint": "https://api.santiment.net/graphql",
+      "method": "POST",
+      "request_body": "{\"query\":\"{ getMetric(metric: \\\"social_volume_total\\\"){ timeseriesData(slug: \\\"bitcoin\\\", from: \\\"<1y-ago>\\\", to: \\\"<30d-ago>\\\", interval: \\\"1d\\\"){ datetime value } } }\"}",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Free SANAPI tier (even keyless): data window restricted to [now-1y, now-30d]; complexity-based throttling.",
+      "sample_response_snippet": "{\"data\":{\"getMetric\":{\"timeseriesData\":null}},\"errors\":[{\"message\":\"Both `from` and `to` parameters are outside the allowed interval you can query social_volume_total with your current subscription SANAPI FREE. Upgrade to a higher tier... Allowed: `from` 2025-06-10, `to` 2026-05-11\"}]}",
+      "value_for_decisions": "API answers keyless (200, valid GraphQL) and confirms a free SANAPI tier \u2014 but social metrics are LAGGED 30 DAYS on it (verified in the live error message). Worthless for live trading; only useful offline to backtest/calibrate what social-volume spikes historically did to perp prices. Do not poll in the live swarm."
+    },
+    {
+      "name": "CryptoPanic news aggregator",
+      "category": "news-sentiment",
+      "endpoint": "https://cryptopanic.com/api/developer/v2/posts/?auth_token={free_key}&public=true&filter=hot",
+      "method": "GET",
+      "auth": "free-key",
+      "verified": false,
+      "rate_limit": "Free developer plan: ~100 req/day (per their docs) \u2014 very tight.",
+      "sample_response_snippet": "Keyless request verified live: returns the HTML site, not JSON \u2014 auth_token is mandatory.",
+      "value_for_decisions": "Vote-based bullish/bearish news tagging per currency; nice but the free quota (\u22481 poll per 15 min) and key requirement make it a low-priority fallback behind Binance announcements + Reddit."
+    },
+    {
+      "name": "4chan /biz/ catalog",
+      "category": "social-sentiment (degen early-warning)",
+      "endpoint": "https://a.4cdn.org/biz/catalog.json (thread detail: https://a.4cdn.org/biz/thread/{no}.json)",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "API rules: max 1 req/sec, and MUST use If-Modified-Since on re-polls; catalog Cache-Control max-age=5, stale-while-revalidate=10. ETag supported (got W/\"6a28c109-20940\").",
+      "sample_response_snippet": "[{\"page\":1,\"threads\":[{\"no\":60278989,\"sticky\":1,\"closed\":1,\"now\":\"04/25/25(Fri)16:47:07\",\"name\":\"Anonymous\",\"sub\":\"Welcome to /biz/ - Business & Finance\",\"com\":\"This board is for the discussion of topics related to business, economics, financial markets, securities, currencies...",
+      "value_for_decisions": "Verified live and structurally rich (sub/com/replies/last_modified per thread, whole catalog in one call). Reality check on signal vs noise \u2014 top threads by replies right now: /smg/ stock general (328), XRP Schizo General (269), precious metals (229), macro shitposts. Crypto-perp alpha here is RARE but EARLY: new-ticker shilling threads appear on /biz/ hours before Reddit. Use as a regex mention-counter only ($TICKER, coin names) \u2014 never as polarity (irony-poisoned). Swarm: 1 poll/60s with If-Modified-Since (one request), diff thread list, count ticker mentions across sub+com, alert on a ticker appearing in 3+ distinct new threads within an hour."
+    },
+    {
+      "name": "Hyperliquid /info meta diff (NEW PERP LISTING detector)",
+      "category": "new-listing-detection",
+      "endpoint": "https://api.hyperliquid.xyz/info (testnet: https://api.hyperliquid-testnet.xyz/info)",
+      "method": "POST",
+      "request_body": "{\"type\":\"meta\"} | {\"type\":\"metaAndAssetCtxs\"} | {\"type\":\"spotMeta\"}",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Official: 1200 weight/min per IP; meta-class info requests cost weight 20 \u2192 up to 60 polls/min theoretical; 1 poll per 10-30s is ample.",
+      "sample_response_snippet": "{\"universe\":[{\"szDecimals\":5,\"name\":\"BTC\",\"maxLeverage\":40,\"marginTableId\":56},{\"szDecimals\":4,\"name\":\"ETH\",\"maxLeverage\":25,\"marginTableId\":55},...{\"szDecimals\":1,\"name\":\"MATIC\",\"maxLeverage\":20,\"marginTableId\":20,\"isDelisted\":true},...",
+      "value_for_decisions": "THE highest-value new-listing signal for this agent and it's already the venue you trade on. Diff the meta.universe name set between polls \u2192 a new entry IS a new HL perp listing (also watch isDelisted flips). New HL listings reliably get a volatility/funding burst in the first hours. metaAndAssetCtxs (verified 200) adds funding, openInterest, dayNtlVlm per asset in the same call \u2192 hype confirmation: social spike + OI/volume acceleration = actionable. spotMeta (verified 200) catches new HIP-1 spot tokens that often precede perp listings. Swarm: one watcher polling metaAndAssetCtxs every 15-30s, emitting NEW_LISTING and OI_SPIKE events to the deciders. Repo already has the HL provider plumbing \u2014 this is a cheap extension."
+    },
+    {
+      "name": "DexScreener (new/hyped token discovery)",
+      "category": "new-coin-discovery",
+      "endpoint": "https://api.dexscreener.com/token-profiles/latest/v1 ; https://api.dexscreener.com/token-boosts/latest/v1 ; https://api.dexscreener.com/latest/dex/search?q={term}",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Docs: 60 req/min for token-profiles/token-boosts; 300 req/min for latest/dex/*. Responses CDN-cached 30s (Cache-Control: public, max-age=30).",
+      "sample_response_snippet": "[{\"url\":\"https://dexscreener.com/solana/7j8qdcnywd61lvhs78kd76rraeskpzpeobma1bywpump\",\"chainId\":\"solana\",\"tokenAddress\":\"7J8qdcnYwd61LVHs78kd76rRAEskPzPeoBMa1byWpump\",\"icon\":\"https://cdn.dexscreener.com/cms/images/...\",\"description\":\"This coin is PVE.\",\"links\":[{\"type\":\"twitter\",\"url\":\"https://x.com/...\"}]",
+      "value_for_decisions": "All three endpoints verified 200 keyless. token-boosts/latest = tokens whose teams are PAYING for promotion right now \u2014 a literal 'someone is about to shill this' feed; token-profiles/latest = newest token profiles (new-coin discovery, mostly Solana pump.fun mints); /latest/dex/search gives price/liquidity/volume/txn counts per pair for any term. For a PERP agent the use is indirect: detect on-chain memecoin hype waves early, then check if the theme maps to an HL-listed perp (e.g. Solana memecoin wave \u2192 SOL/WIF/POPCAT perps). Swarm: poll boosts+profiles every 60s, diff, resolve chain/ticker, cross-reference against HL universe. (pump.fun's own frontend API returned 530 \u2014 dead/blocked; DexScreener covers it.)"
+    },
+    {
+      "name": "GeckoTerminal new/trending pools",
+      "category": "new-coin-discovery",
+      "endpoint": "https://api.geckoterminal.com/api/v2/networks/new_pools?page=1 ; https://api.geckoterminal.com/api/v2/networks/trending_pools?page=1 (per-chain: /networks/{network}/new_pools)",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Docs: 30 calls/min free (keyless). Cache-Control max-age=30 server-side.",
+      "sample_response_snippet": "{\"data\":[{\"id\":\"solana_FCwD1MWKNtg8W6AmHj3sYPKABc69uD4S3MFW7CSfMhgY\",\"type\":\"pool\",\"attributes\":{\"base_token_price_usd\":\"0.00000418666...\",\"quote_token_price_usd\":\"1.00127...\",...",
+      "value_for_decisions": "Both endpoints verified 200 keyless. new_pools = newly created DEX pools across all chains within minutes of creation (the fastest free 'new coin exists' signal, since CoinGecko's own new-coins list is paywalled); trending_pools = where on-chain volume is rotating NOW. Attributes include price changes, volume_usd, reserve, transactions buys/sells (buy/sell imbalance = on-chain polarity). Swarm: 1 poll/min each, filter reserve_usd > threshold to kill rug-noise, same HL-universe cross-reference as DexScreener."
+    },
+    {
+      "name": "Binance new-listing announcements (unofficial CMS API)",
+      "category": "new-listing-detection",
+      "endpoint": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query?type=1&pageNo=1&pageSize=10&catalogId=48",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Undocumented (frontend API behind WAF). Keep to ~1 req/min with a browser User-Agent; can geo-block or change shape without notice.",
+      "sample_response_snippet": "{\"code\":\"000000\",\"message\":null,\"data\":{\"catalogs\":[{\"catalogId\":48,\"catalogName\":\"New Cryptocurrency Listing\",\"total\":2172,\"articles\":[{\"id\":276476,\"title\":\"Binance Futures Will Launch Multiple USDS-Margined TradFi Perpetual Contracts (2026-06-09)\",\"type\":1,\"releaseDate\":1780985712545}...",
+      "value_for_decisions": "Verified 200 from this machine with a browser UA. Catalog 48 = 'New Cryptocurrency Listing' \u2014 titles + releaseDate (ms) for spot AND futures launches. A Binance listing/futures announcement is the single most price-moving listing event in crypto; coins listed on Binance that already trade as HL perps spike on the announcement. Swarm: poll every 60s, regex tickers out of new titles, emit BINANCE_LISTING event; treat as fragile (unofficial) with circuit-breaker on shape change."
+    },
+    {
+      "name": "CoinPaprika tickers",
+      "category": "market-data (backup)",
+      "endpoint": "https://api.coinpaprika.com/v1/tickers?limit=100 (also /v1/coins \u2014 includes is_new flag for recently added coins)",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Free tier: ~20,000 calls/month per docs, no key needed; responses cached ~5s (Cache-Control max-age=5).",
+      "sample_response_snippet": "[{\"id\":\"btc-bitcoin\",\"name\":\"Bitcoin\",\"symbol\":\"BTC\",\"rank\":1,\"total_supply\":20040769,\"max_supply\":21000000,\"beta_value\":0.958385,\"first_data_at\":\"2010-...",
+      "value_for_decisions": "Verified 200 keyless. Redundant with CoinGecko for prices but with an INDEPENDENT, less-contended rate budget \u2014 useful as the fallback when the shared CoinGecko keyless pool 429s (which it does after ~5 quick calls, measured). /v1/coins carries an is_new boolean = free new-coin flag. Swarm: failover provider behind the CoinGecko client, plus a daily is_new scan."
+    },
+    {
+      "name": "CoinMarketCap frontend data-api",
+      "category": "new-coin-discovery (rejected)",
+      "endpoint": "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing?start=1&limit=100&sortBy=date_added&sortType=desc",
+      "method": "GET",
+      "auth": "none",
+      "verified": true,
+      "rate_limit": "Undocumented frontend API.",
+      "sample_response_snippet": "{\"data\":{\"cryptoCurrencyList\":[{\"id\":1,\"name\":\"Bitcoin\",\"symbol\":\"BTC\",\"slug\":\"bitcoin\",\"tags\":[\"mineable\",\"pow\",\"sha-256\",...]}]}} \u2014 note: returned BTC (dateAdded 2010) despite sortType=desc",
+      "value_for_decisions": "Endpoint is live keyless (200) but VERIFIED BROKEN for the intended use: sortBy=date_added is ignored/inverted (returned BTC, LTC, NMC \u2014 oldest coins \u2014 with sortType=desc), and /listing/new is 404. Do not use; GeckoTerminal new_pools + DexScreener cover new-coin discovery properly."
+    }
+  ],
+  "summary": "Verified 16 free sources live from this machine (no keys). KEY ENVIRONMENT FINDING: this box egresses through a datacenter IP (AMS), so Reddit's own JSON (www/old/api/.rss, any UA, and WebFetch) is hard-403'd \u2014 Reddit public JSON is therefore marked unverified and must NOT be the plan's backbone from this host. The working keyless Reddit path is Arctic Shift (arctic-shift.photon-reddit.com): verified live with 6-minute-fresh r/CryptoCurrency posts, full post+comment schema, and ~1000-req rate budget; PullPush also answers but its data is 13 months stale (verified) \u2014 skip. r/Hyperliquid is effectively dead (newest archived post >2y old); use r/CryptoCurrency, r/CryptoMarkets, r/solana, r/CryptoMoonShots for velocity and StockTwits HYPE.X for Hyperliquid-token chatter. VERIFIED WINNERS by role: (1) Sentiment polarity: StockTwits symbol streams ({SYM}.X.json \u2014 BTC.X and HYPE.X verified; user-labeled Bullish/Bearish, ~200 req/hr) + Arctic Shift text for cheap-model classification; alternative.me F&G verified (daily regime dial, currently 9 Extreme Fear). (2) New-listing detection (most actionable for a perp agent): Hyperliquid POST /info {type:meta|metaAndAssetCtxs|spotMeta} all verified \u2014 diff the universe array to catch new HL perps within seconds (1200 weight/min budget, ~20 weight/call), with funding/OI/volume in the same response for hype confirmation; Binance unofficial CMS announcements API verified 200 (catalog 48 'New Cryptocurrency Listing' incl. futures launches). (3) New-coin/on-chain hype: GeckoTerminal new_pools + trending_pools (30/min keyless) and DexScreener token-profiles + token-boosts (60/min; boosts = teams paying to promote = pre-shill feed) \u2014 all verified. (4) Attention: CoinGecko /search/trending verified, but MEASURED keyless limit is ~5 calls/min before 429 (demo key: 30/min, 10k/mo) \u2014 dedicate one shared poller; CoinPaprika verified as independent fallback budget. REJECTED with live evidence: pytrends (instant 429 from this IP), LunarCrush (401, key required), CryptoPanic (HTML without key, 100/day free), Santiment keyless (works but social data lagged 30 days \u2014 backtests only), CoinGecko /coins/list/new (401, paid), pump.fun frontend (530), CMC frontend date_added sort (broken). Suggested swarm cadence: HL meta watcher 15-30s; Binance CMS + DexScreener boosts/profiles + GeckoTerminal 60s; Arctic Shift per-sub 60s; 4chan /biz/ catalog 60s with If-Modified-Since (verified live; treat as ticker-mention counter only \u2014 top threads are stock/PM generals, polarity unusable); StockTwits round-robin within 200/hr; CoinGecko trending 120s; F&G daily. All pollers should diff-and-emit-events (new entrant, z-score spike) rather than ship raw payloads to the deciders, and honor ETag/If-Modified-Since (4chan ETag and DexScreener/GeckoTerminal 30s caches verified in headers)."
+}
