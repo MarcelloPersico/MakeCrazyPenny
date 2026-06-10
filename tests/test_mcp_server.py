@@ -51,6 +51,28 @@ async def test_tools_and_prompts_registered() -> None:
     assert {"decide_crypto", "bull_case_crypto", "bear_case_crypto", "decide_crypto_market"} <= prompts
 
 
+async def test_swarm_journal_tools_registered() -> None:
+    tools = {t.name for t in await srv.mcp.list_tools()}
+    assert {
+        "swarm_goal_get", "swarm_goal_set", "journal_record",
+        "journal_recent", "journal_digest", "journal_performance",
+    } <= tools
+
+
+def test_journal_record_kind_threads_into_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setenv("MCP_CACHE_DIR", str(tmp_path))
+    rec = json.loads(srv.journal_record_tool("review memo", kind="strategy-review"))
+    assert rec["kind"] == "strategy-review" and rec["journaled"] is True
+    srv.journal_record_tool("plain cycle", action="none", symbol="btc")
+    out = json.loads(srv.journal_digest_tool(n_cycles=5))
+    assert out["cycles_since_review"] == 1
+    assert out["last_review"]["summary"] == "review memo"
+    assert out["cycles"][-1]["symbol"] == "BTCUSDT"  # canonicalized by the tool
+    assert "kind" not in out["cycles"][-1]  # untagged cycles carry no kind
+
+
 def test_prompt_builders_normalize_symbol_and_mention_flow() -> None:
     decide = srv.build_decide_prompt("$aapl", 3)
     assert "AAPL" in decide

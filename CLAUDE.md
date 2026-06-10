@@ -45,7 +45,25 @@ Needs `MCP_HL_PRIVATE_KEY` (testnet wallet) and, for an API/agent key, `MCP_HL_A
   `/loop 15m /trade-swarm`. Set the objective once via `swarm_goal_set`.
 - Scout/news/chart subagents live in `.claude/agents/` (haiku/sonnet/opus; no trading
   tools) — only the host session places orders, through the §18.5 risk gate.
-- Scoreboard: `journal_performance` (PnL vs fills); memory: `journal_recent`.
+- Every 4th cycle (~hourly) `/trade-swarm` auto-runs `/strategy-review` (CONTRACT §18.7):
+  a 4-leg workflow (haiku regime survey / sonnet perf audit + macro news / opus majors
+  deep-dive) that refreshes the goal's `|| STRATEGY @ ...` block. Risk-reducing position
+  actions only; cadence = `journal_digest`'s `cycles_since_review` (resets on the
+  `kind: "strategy-review"` journal record).
+- Context discipline in looped sessions: cycle-start state = ONE `journal_digest` call
+  (bounded/clipped; replaces `journal_recent` + `journal_performance` there — the full
+  scoreboard runs only inside the hourly review). The journal is the swarm's memory;
+  chat replies stay ~10 lines, never raw workflow/tool JSON.
+- Scoreboard: `journal_performance` (PnL vs fills); deep history: `journal_recent`.
+
+## Compact instructions
+
+When compacting a trading-swarm session, preserve verbatim: the standing goal string
+(including its `|| STRATEGY @ ...` block), open positions with their theses and
+invalidations, the last strategy-review memo, and any user risk authorizations. Drop
+raw tool outputs and per-leg workflow JSON — the server-side journal is the durable
+copy; the resumed session rehydrates with one `journal_digest` call instead of
+reconstructing cycle history from the summary.
 
 ## Conventions
 - Import-safe (lazy heavy imports / SDK; no network at import). Keyless-first; every user output carries the `DISCLAIMER`. CLI output is strictly ASCII.

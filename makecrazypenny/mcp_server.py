@@ -709,11 +709,19 @@ def journal_record_tool(
     scout: str | None = None,
     news: str | None = None,
     chart: str | None = None,
+    kind: str | None = None,
 ) -> str:
-    """Append a cycle record to the journal; return the stored entry as JSON."""
+    """Append a cycle record to the journal; return the stored entry as JSON.
+
+    ``kind`` tags special entries — a strategy review records
+    ``kind="strategy-review"`` and the swarm's hourly review cadence counts
+    cycles since the last such tag (via ``journal_digest``).
+    """
     from .orchestration import journal as journal_mod
 
     cycle: dict[str, Any] = {"summary": summary, "action": action}
+    if kind:
+        cycle["kind"] = str(kind).strip()
     if symbol:
         cycle["symbol"] = canonical_crypto(symbol)
     if thesis:
@@ -743,6 +751,25 @@ def journal_recent_tool(n: int = 10) -> str:
     from .orchestration import journal as journal_mod
 
     return _dumps(journal_mod.recent(int(n)))
+
+
+@mcp.tool(
+    name="journal_digest",
+    title="Compact swarm-state digest (context rehydration)",
+    description=(
+        "ONE bounded call for cycle-start context (preferred over swarm_goal_get + "
+        "journal_recent in looped sessions): the standing goal, cycles_since_review (the "
+        "strategy-review cadence counter, computed server-side), the last review memo, and "
+        "clipped one-line rows for recent cycles/decisions plus the equity tail. Every field "
+        "is hard-capped so repeated calls keep the host's context small; also the rehydration "
+        "call after a context compaction. Keyless (reads local files only)."
+    ),
+)
+def journal_digest_tool(n_cycles: int = 6, n_decisions: int = 8) -> str:
+    """Return the compact swarm-state digest as JSON."""
+    from .orchestration import journal as journal_mod
+
+    return _dumps(journal_mod.digest(int(n_cycles), int(n_decisions)))
 
 
 @mcp.tool(
@@ -1312,10 +1339,15 @@ def build_trade_swarm_prompt(goal: str = "") -> str:
         "You are running one full cycle of MakeCrazyPenny's TRADING SWARM on the Hyperliquid "
         "TESTNET (paper money). You are the portfolio manager and the ONLY agent allowed to "
         f"touch the paper_* trading tools.\n\n{goal_line}"
-        "0. CONTEXT - Call `swarm_goal_get` (if unset and no override was given, use: 'grow "
-        "testnet equity with leveraged perp trades, risk-gated'). Call `journal_performance` "
-        "and `journal_recent` (last 5) for open theses, hit rate, and lessons. Call "
-        "`paper_account` for equity, margin in use, and open positions.\n"
+        "0. CONTEXT - Call `journal_digest` (ONE compact call: standing goal, recent cycle "
+        "one-liners, open theses, equity tail, and cycles_since_review). If the goal is unset "
+        "and no override was given, use: 'grow testnet equity with leveraged perp trades, "
+        "risk-gated'. Call `paper_account` for equity, margin in use, and open positions. "
+        "Keep context lean: do NOT call journal_recent/journal_performance every cycle - the "
+        "digest is the cycle-start read; the scoreboard belongs to the hourly strategy "
+        "review. If digest.cycles_since_review >= 4, run a STRATEGY REVIEW first (deep "
+        "performance audit + regime/macro/majors read), refresh the goal's '|| STRATEGY' "
+        "block via `swarm_goal_set`, and `journal_record` it with kind='strategy-review'.\n"
         "1. FAN OUT - If you have a sub-agent / Task capability, spawn THREE agents in "
         "parallel and give cheap fast models the cheap jobs: a HYPE SCOUT (fast/cheap model, "
         "e.g. haiku) calling `market_pulse` + `social_scan` for new listings, hype velocity, "
@@ -1338,9 +1370,10 @@ def build_trade_swarm_prompt(goal: str = "") -> str:
         "disagrees with engine sizing. If the risk gate refuses, do NOT fight it - journal the "
         "refusal. No STRONG setup -> trade nothing; AVOID is a position.\n"
         "5. JOURNAL + REPORT - Call `journal_record` with the cycle summary (scout/news/chart "
-        "one-liners, fused decision, action, thesis + invalidation). Then report: PnL and hit "
-        "rate from `journal_performance`, open positions with theses, what you did this cycle, "
-        "and what would change your mind before the next cycle.\n\n"
+        "one-liners, fused decision, action, thesis + invalidation). Then report COMPACTLY "
+        "(~10 lines, no raw tool/JSON dumps - the journal, not the chat, is your memory): "
+        "equity change from the digest's tail, open positions with theses, what you did this "
+        "cycle, and what would change your mind before the next cycle.\n\n"
         "Safety: testnet only, paper money - still treat it as real. Never disable the risk "
         "gate; never raise leverage_cap above the engine default. This is informational only "
         "and is NOT investment advice."
@@ -1367,8 +1400,24 @@ def trade_swarm_prompt(goal: str = "") -> str:
 _ = (Settings, DISCLAIMER)
 
 
+def _preload_heavy_libs() -> None:
+    """Import the C-extension stack before the event loop starts.
+
+    The analysis layer imports pandas/numpy lazily inside request handlers
+    (CONTRACT.md §2.2 keeps module import light). On Windows, loading numpy's
+    C extensions for the first time while the asyncio loop is serving and
+    worker threads exist can deadlock in the native DLL loader, freezing the
+    loop and every queued tool call with it. Importing here happens once,
+    single-threaded, before anything is in flight — module import of
+    :mod:`makecrazypenny.mcp_server` itself stays heavy-import-free.
+    """
+    import numpy  # noqa: F401
+    import pandas  # noqa: F401
+
+
 def main() -> None:
     """Console-script entrypoint: run the MCP server over stdio."""
+    _preload_heavy_libs()
     mcp.run(transport="stdio")
 
 

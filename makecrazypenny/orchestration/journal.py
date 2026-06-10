@@ -304,6 +304,112 @@ def recent(n: int = 10, *, settings: Settings | None = None) -> dict[str, Any]:
     }
 
 
+#: Field clip lengths for :func:`digest` rows (keep the payload bounded).
+_DIGEST_CLIP_SUMMARY = 200
+_DIGEST_CLIP_REVIEW = 400
+_DIGEST_CLIP_SHORT = 120
+
+#: The ``kind`` tag a strategy review stamps on its cycle entry (§18.7); the
+#: swarm's review cadence counts cycle entries since the last one.
+REVIEW_KIND = "strategy-review"
+
+
+def _clip(value: Any, limit: int) -> str:
+    """``value`` as a string, hard-capped at ``limit`` chars (ellipsis suffix)."""
+    s = str(value)
+    return s if len(s) <= limit else s[: max(0, limit - 3)] + "..."
+
+
+def digest(
+    n_cycles: int = 6,
+    n_decisions: int = 8,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Compact, bounded swarm-state digest — the context-rehydration call.
+
+    One offline read replacing ``goal_get`` + ``recent`` dumps at cycle start:
+    the standing goal, ``cycles_since_review`` (the §18.7 strategy-review
+    cadence counter, computed here so the host never parses the journal), the
+    last review memo, and clipped one-line rows for the recent cycles /
+    decisions / equity tail. Every free-text field is hard-capped, and the
+    verbose per-leg cycle fields (``scout``/``news``/``chart``) are dropped
+    on purpose — they are exactly what bloats a looped session's context.
+    """
+    n_cycles = max(1, int(n_cycles))
+    n_decisions = max(1, int(n_decisions))
+    cycles = read_cycles(settings=settings)
+    decisions = read_decisions(settings=settings)
+    equity = read_equity(settings=settings)
+
+    review_idx: int | None = None
+    for i in range(len(cycles) - 1, -1, -1):
+        if cycles[i].get("kind") == REVIEW_KIND:
+            review_idx = i
+            break
+    last_review: dict[str, Any] | None = None
+    if review_idx is None:
+        cycles_since_review = len(cycles)
+    else:
+        cycles_since_review = len(cycles) - review_idx - 1
+        r = cycles[review_idx]
+        last_review = {
+            "ts": r.get("ts"),
+            "summary": _clip(r.get("summary") or "", _DIGEST_CLIP_REVIEW),
+        }
+
+    def _cycle_row(c: dict[str, Any]) -> dict[str, Any]:
+        row: dict[str, Any] = {"ts": c.get("ts")}
+        if c.get("kind"):
+            row["kind"] = c.get("kind")
+        row["summary"] = _clip(c.get("summary") or "", _DIGEST_CLIP_SUMMARY)
+        for key in ("action", "symbol"):
+            if c.get(key):
+                row[key] = c.get(key)
+        for key in ("thesis", "invalidation"):
+            if c.get(key):
+                row[key] = _clip(c.get(key), _DIGEST_CLIP_SHORT)
+        return row
+
+    def _decision_row(d: dict[str, Any]) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "ts": d.get("ts"),
+            "symbol": d.get("symbol"),
+            "direction": d.get("direction"),
+            "conviction": d.get("conviction"),
+            "entry": d.get("entry"),
+            "stop": d.get("stop"),
+            "target": d.get("target"),
+            "leverage": d.get("leverage"),
+            "cloid": d.get("cloid"),
+        }
+        if d.get("summary"):
+            row["summary"] = _clip(d.get("summary"), _DIGEST_CLIP_SHORT)
+        return row
+
+    def _equity_row(e: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ts": e.get("ts"),
+            "account_value": e.get("account_value"),
+            "tradable_usdc": e.get("tradable_usdc"),
+            "n_positions": e.get("n_positions"),
+            "unrealized_pnl": e.get("unrealized_pnl"),
+        }
+
+    goal = goal_get(settings=settings)
+    return {
+        "goal": goal.get("goal"),
+        "goal_updated_at": goal.get("updated_at"),
+        "cycles_since_review": cycles_since_review,
+        "last_review": last_review,
+        "cycles": [_cycle_row(c) for c in cycles[-n_cycles:]],
+        "decisions": [_decision_row(d) for d in decisions[-n_decisions:]],
+        "equity": [_equity_row(e) for e in equity[-3:]],
+        "counts": {"cycles": len(cycles), "decisions": len(decisions)},
+        "disclaimer": DISCLAIMER,
+    }
+
+
 def daily_loss_baseline(
     entries: list[dict[str, Any]] | None = None,
     *,
@@ -653,6 +759,8 @@ __all__ = [
     "read_cycles",
     "read_equity",
     "recent",
+    "digest",
+    "REVIEW_KIND",
     "daily_loss_baseline",
     "reconcile",
     "performance",

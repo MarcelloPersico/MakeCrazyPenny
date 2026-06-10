@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Trading-swarm session resumed after context compaction: rehydrate with the journal_digest tool (standing goal, open theses, cycles_since_review, last strategy-review memo) - do NOT reconstruct cycle history from the summarized conversation.'"
+          }
+        ]
+      }
+    ]
+  }
+}

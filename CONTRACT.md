@@ -1068,8 +1068,14 @@ tolerant readers skip corrupt lines. `record_decision` (auto-called on placement
 generated `cloid` + exchange oids), `record_cycle`, `snapshot_equity`, `reconcile` (cloid → oid →
 symbol+window matching; realized PnL, R-multiple, win/loss), `performance()` (scoreboard:
 hit rate, avg R, PnL by symbol, equity tail), `goal_get`/`goal_set`. Journaling failure NEVER
-blocks an order. MCP tools: `swarm_goal_get`/`swarm_goal_set`, `journal_record`,
-`journal_recent`, `journal_performance`; plus data tools `market_pulse`, `orderflow`,
+blocks an order. `digest()` is the CONTEXT-LEAN read for looped sessions: one bounded payload
+(goal, `cycles_since_review` computed from §18.7's `kind: "strategy-review"` tags, the last
+review memo, and hard-clipped one-line rows for recent cycles/decisions + equity tail; the
+verbose per-leg cycle fields are dropped by design) — cycle starts call it INSTEAD of
+`recent`+`performance`, and it is the rehydration call after a host-side context compaction.
+`record_cycle` entries may carry a free-form `kind` (exposed as a `journal_record` tool param).
+MCP tools: `swarm_goal_get`/`swarm_goal_set`, `journal_record`, `journal_recent`,
+`journal_digest`, `journal_performance`; plus data tools `market_pulse`, `orderflow`,
 `social_scan`, `news_feed`.
 
 ### 18.5 Risk gate (in `paper_trade`, before any order)
@@ -1089,3 +1095,20 @@ estimators), `kelly_calibrated` (p shrunk toward realized journal hit-rate; quar
 `hyperliquid_info_url` (`MCP_HL_INFO_URL`; read-only data, see §17.1); risk-gate knobs above are
 read from the environment at call time (no Settings fields). New TTLs per §8.5 table in
 `core/config.py` (ctx/pulse 30s, l2book 5s, histories 300s, social 120s, news 300s).
+
+### 18.7 Hourly strategy review (every 4th cycle)
+
+Every 4th swarm cycle (~hourly at the 15m loop) the host runs `/strategy-review`
+(`.claude/commands/strategy-review.md` + `.claude/workflows/strategy-review.js`): four read-only
+legs routed cheap-jobs-to-cheap-models — regime/pulse/funding survey (haiku, mechanical relay),
+journal-performance audit (sonnet, cites scoreboard numbers), macro news scan (sonnet
+`news-reader`, days-to-weeks themes + scheduled events), BTC/ETH/SOL multi-timeframe +
+positioning deep-dive (opus `chart-analyst`). The HOST fuses them into a strategy memo, may take
+risk-REDUCING position actions only (close/tighten; entries remain §18.1's cycle path), and
+persists the strategy by rewriting the standing goal as
+`<core objective> || STRATEGY @ <UTC>: bias/gross/focus/avoid/timeframes/fixes` (the block after
+`" || STRATEGY"` is replaced wholesale; the core objective is never touched) — subsequent cycles
+pipe it verbatim into the sub-agent preambles. Cadence is STATELESS, derived from §18.4's journal:
+the review records a cycle entry with `kind: "strategy-review"`, and §18.4's `digest()` computes
+`cycles_since_review` server-side — each `/trade-swarm` cycle reads it off `journal_digest`
+(due at >= 4; scalp loops additionally require the last review to be > ~50 min old).

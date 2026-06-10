@@ -231,6 +231,72 @@ def test_record_cycle_snapshot_and_recent(settings: Settings) -> None:
     assert "disclaimer" in out
 
 
+def test_digest_empty_journal(settings: Settings) -> None:
+    d = journal.digest(settings=settings)
+    assert d["goal"] is None and d["goal_updated_at"] is None
+    assert d["cycles_since_review"] == 0
+    assert d["last_review"] is None
+    assert d["cycles"] == [] and d["decisions"] == [] and d["equity"] == []
+    assert d["counts"] == {"cycles": 0, "decisions": 0}
+    assert "disclaimer" in d
+
+
+def test_digest_counts_cycles_since_review_and_drops_leg_verbosity(settings: Settings) -> None:
+    journal.goal_set("core || STRATEGY @ t0: bias=long", settings=settings)
+    journal.record_cycle({"summary": "memo r0", "kind": journal.REVIEW_KIND}, settings=settings)
+    for i in range(3):
+        journal.record_cycle(
+            {"summary": f"c{i}", "action": "none", "scout": "x" * 500, "news": "y" * 500},
+            settings=settings,
+        )
+    d = journal.digest(settings=settings)
+    assert d["goal"] == "core || STRATEGY @ t0: bias=long"
+    assert d["cycles_since_review"] == 3
+    assert d["last_review"]["summary"] == "memo r0"
+    # The verbose per-leg fields are dropped by design (context budget).
+    assert all("scout" not in row and "news" not in row for row in d["cycles"])
+    # A fresh review resets the counter to 0.
+    journal.record_cycle({"summary": "memo r1", "kind": journal.REVIEW_KIND}, settings=settings)
+    d2 = journal.digest(settings=settings)
+    assert d2["cycles_since_review"] == 0
+    assert d2["last_review"]["summary"] == "memo r1"
+
+
+def test_digest_without_review_counts_all_cycles(settings: Settings) -> None:
+    for i in range(5):
+        journal.record_cycle({"summary": f"c{i}"}, settings=settings)
+    assert journal.digest(settings=settings)["cycles_since_review"] == 5
+
+
+def test_digest_clips_fields_and_bounds_rows(settings: Settings) -> None:
+    journal.record_cycle(
+        {"summary": "s" * 500, "thesis": "t" * 500, "kind": journal.REVIEW_KIND},
+        settings=settings,
+    )
+    for i in range(9):
+        journal.record_cycle({"summary": f"c{i}", "symbol": "BTCUSDT"}, settings=settings)
+    journal.record_decision(
+        _decision_payload(summary="d" * 500), cloid="0xabc", entry_price=100.0, settings=settings
+    )
+    journal.snapshot_equity(
+        {"address": _ADDRESS, "account_value": 900.0, "tradable_usdc": 1000.0, "positions": []},
+        settings=settings,
+    )
+    d = journal.digest(n_cycles=2, n_decisions=8, settings=settings)
+    assert len(d["cycles"]) == 2 and d["counts"]["cycles"] == 10
+    assert [c["summary"] for c in d["cycles"]] == ["c7", "c8"]
+    # The review entry is older than the n_cycles window but still surfaces.
+    assert len(d["last_review"]["summary"]) == 400 and d["last_review"]["summary"].endswith("...")
+    dec = d["decisions"][0]
+    assert dec["symbol"] == "BTCUSDT" and dec["cloid"] == "0xabc"
+    assert dec["entry"] == 100.0 and dec["stop"] == 95.0 and dec["target"] == 120.0
+    assert len(dec["summary"]) == 120 and dec["summary"].endswith("...")
+    eq = d["equity"][-1]
+    assert eq["tradable_usdc"] == 1000.0 and eq["n_positions"] == 0
+    # Equity rows never carry the address (digest is single-account context).
+    assert set(eq) == {"ts", "account_value", "tradable_usdc", "n_positions", "unrealized_pnl"}
+
+
 def test_daily_loss_baseline_prefers_pre_midnight_snapshot() -> None:
     midnight = _midnight_ms()
     entries = [

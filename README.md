@@ -361,6 +361,17 @@ set): `/trade-swarm` (repo command) or the `trade_swarm` MCP prompt. Loop it:
 `/loop 15m /trade-swarm`. Set a standing objective once with `swarm_goal_set` — every
 future cycle (including scheduled headless ones) reads it back with `swarm_goal_get`.
 
+**Every 4th cycle (hourly at the 15m loop) the swarm steps back for a strategy
+review** (`/strategy-review`, also runnable on demand): a second workflow fans out a
+haiku regime/pulse/funding survey, a sonnet journal-performance audit, a sonnet macro
+news scan (days-to-weeks themes and scheduled events), and an opus BTC/ETH/SOL
+multi-timeframe deep-dive — the host fuses them into a strategy memo, may close or
+tighten (never open) positions, and refreshes the standing goal with a compact
+`|| STRATEGY @ <time>: bias/focus/avoid/timeframes/fixes` block that every subsequent
+cycle inherits. The cadence is stateless: the review journals itself with
+`kind: "strategy-review"`, and each cycle counts the journal entries since the last
+one (scalp loops additionally throttle the review to ~hourly by timestamp).
+
 The engine itself stays **AI-free**: the new scored factors (taker flow, CVD,
 top-trader spread, funding z-score, HL predicted funding, social velocity) are pure
 deterministic computations on keyless data; what the LLM agents *think* only enters
@@ -370,7 +381,11 @@ cost is now Hyperliquid-native (hourly), not the CEX 8h rate.
 **PnL is tracked automatically**: every placed order is journaled (JSONL under the
 cache dir) with a client order id, `journal_performance` reconciles decisions against
 actual testnet fills (hit rate, average R, realized PnL per symbol, equity curve), and
-`journal_recent` gives each new cycle the swarm's memory. A **risk gate** runs before
+`journal_digest` gives each new cycle the swarm's memory in ONE bounded, hard-clipped
+payload (goal, recent cycle/decision one-liners, equity tail, and the strategy-review
+cadence counter) — designed so hours-long looped sessions stay context-lean and can
+rehydrate losslessly after a context compaction (`journal_recent` remains for deep
+history). A **risk gate** runs before
 every order: max 3 same-direction positions (`MCP_SWARM_MAX_POSITIONS`), a daily-loss
 kill-switch (`MCP_SWARM_MAX_DAILY_LOSS_PCT`, default 5% of the UTC-midnight equity),
 and a correlated-exposure cap (BTC-beta buckets, 2x equity, auto-downsizing). Refusals
@@ -383,8 +398,8 @@ until you explicitly decide otherwise), e.g. in `.claude/settings.json` →
 `permissions.allow`: `mcp__makecrazypenny__market_pulse`, `orderflow`, `social_scan`,
 `news_feed`, `crypto_decide`, `crypto_evidence`, `crypto_technicals`, `crypto_regime`,
 `crypto_screen`, `derivatives`, `funding_rate`, `paper_pairs`, `paper_account`,
-`paper_orders`, `swarm_goal_get`, `journal_recent`, `journal_performance` (each
-prefixed `mcp__makecrazypenny__`).
+`paper_orders`, `swarm_goal_get`, `journal_recent`, `journal_digest`,
+`journal_performance` (each prefixed `mcp__makecrazypenny__`).
 
 > The swarm trades testnet paper money only, and the host model remains the single
 > point of execution. Informational/educational; NOT investment advice.
