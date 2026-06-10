@@ -7,7 +7,10 @@ scrubs those values so a key never reaches an error string, a log line, the
 dashboard, or an agent transcript.
 
 This is the single chokepoint the provider registry uses when turning a provider
-exception into a human-readable skip/failure reason.
+exception into a human-readable skip/failure reason. The execution layer
+(CONTRACT.md §17) routes its error strings through the same chokepoint so a
+Hyperliquid wallet **private key** (64 hex chars, with or without ``0x``) can
+never leak into a tool result, log line, or transcript.
 """
 
 from __future__ import annotations
@@ -21,6 +24,18 @@ _SECRET_QUERY_PARAM = re.compile(
     r"(?i)([?&](?:token|api[_-]?key|apikey|key|secret|access[_-]?token)=)[^&#\s'\"]+"
 )
 
+# Matches an ``NAME=value`` assignment of a known secret env var (e.g. a leaked
+# ``MCP_HL_PRIVATE_KEY=0x...`` in a config dump), capturing the ``NAME=`` prefix.
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)((?:MCP_HL_PRIVATE_KEY|private[_-]?key|secret[_-]?key)\s*[=:]\s*)[^\s,;'\"]+"
+)
+
+# Matches an Ethereum private key (64 hex chars, with or without the ``0x``
+# prefix) as a standalone token. A 40-hex *address* is deliberately NOT matched —
+# wallet addresses are not secret and stay readable in output. The ``(?![0-9a-fA-F])``
+# guard avoids clipping the first 64 chars of a longer hex blob.
+_PRIVATE_KEY = re.compile(r"(?i)\b(0x)?[0-9a-f]{64}(?![0-9a-fA-F])")
+
 _REDACTED = "***"
 
 
@@ -33,7 +48,10 @@ def redact_secrets(text: object) -> str:
     """
     if text is None:
         return ""
-    return _SECRET_QUERY_PARAM.sub(rf"\1{_REDACTED}", str(text))
+    out = _SECRET_QUERY_PARAM.sub(rf"\1{_REDACTED}", str(text))
+    out = _SECRET_ASSIGNMENT.sub(rf"\1{_REDACTED}", out)
+    out = _PRIVATE_KEY.sub(_REDACTED, out)
+    return out
 
 
 __all__ = ["redact_secrets"]

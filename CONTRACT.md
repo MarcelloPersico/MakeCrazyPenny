@@ -908,3 +908,101 @@ crypto_global   -> [coingecko]                 # total mcap, BTC/ETH dominance
 `crypto_target_vol=0.80`, `crypto_liq_buffer=0.5`, plus `coingecko_api_key`, `binance_base_url`,
 `bybit_base_url`. AI-free and offline-testable; the leverage plan is informational only (carries the
 `DISCLAIMER`) — liquidation is an isolated-margin **estimate**.
+
+## 17. Execution extension — Hyperliquid testnet paper trading
+
+The toolkit's first and only **authenticated, state-mutating** path: placing **paper trades on the
+Hyperliquid testnet** (fake USDC). Everything in §1–§16 is a read-only, keyless
+`Provider.fetch(capability)`; this is the deliberate exception, isolated in a new `execution/`
+layer so the keyless/read-only invariants above stay intact. It carries the same `DISCLAIMER` and
+remains informational/educational — testnet only, no real funds.
+
+### 17.1 Safety rails (non-negotiable)
+
+- **Testnet-locked.** Only `Settings.hyperliquid_testnet_url` is ever used; there is **no mainnet
+  base URL field anywhere**. No env var or argument can route a signed order at real funds.
+- **Import-safe.** The official `hyperliquid-python-sdk` (+ `eth_account`) is imported lazily inside
+  `execution.hyperliquid._build_clients`; importing the package never needs the `trade` extra and
+  never hits the network. The offline test suite runs without the SDK.
+- **Secret-safe.** The signing key comes from `MCP_HL_PRIVATE_KEY`; `core/redact.py` masks any
+  64-hex private key (a 40-hex wallet *address* is not secret and stays readable), and every
+  execution error is routed through `redact_secrets`.
+- **Live by default.** Tools place real testnet orders immediately (no dry-run gate).
+
+### 17.2 Layers
+
+- `execution/hyperliquid.py` — `HyperliquidPaperClient`, a synchronous wrapper over the SDK
+  `Info`/`Exchange` clients (the SDK does the msgpack action-hash + EIP-712 signing). Reads:
+  `account_state`, `open_orders` (incl. trigger metadata via `frontend_open_orders`, falling back
+  to the plain listing), `recent_fills`. Writes: `set_leverage`, `open_position` (market via
+  `market_open`, limit via `order` GTC; optional `stop_loss`/`take_profit` attach after the fill),
+  `set_position_tpsl` (exchange-side stop-loss/take-profit), `close_position` (`market_close`),
+  `cancel_order`. Validates the coin against `info.meta()`, rounds size to `szDecimals`, rounds
+  limit prices to the perp wire format (5 sig figs, ≤`6 - szDecimals` decimals), and enforces the
+  **$10 min order notional**. `_build_clients(settings)` is the monkeypatch seam tests replace.
+- **Position TP/SL (§17.6).** `set_position_tpsl` places reduce-only **trigger-market** orders
+  (`{"trigger": {triggerPx, isMarket: true, tpsl: "sl"|"tp"}}`) via `bulk_orders` under the
+  **`positionTpsl` grouping**, so the exchange OCO-links them to the position: one leg executing
+  (or the position closing) cancels the other, and they keep protecting the trade with no client
+  connected. The closing side/size derive from the live position (`size` overridable); a trigger
+  on the wrong side of the live mid (a stop that would fire instantly) is **rejected**; the fired
+  market leg's `limit_px` bounds slippage at `trigger × (1 ± hl_default_slippage)`. On
+  `open_position`, TP/SL attach only once the entry actually **fills** (a resting limit entry
+  reports `tpsl.skipped`), and an attach failure never voids the entry — it surfaces under
+  `"tpsl"`.
+- `orchestration/paper_trade.py` — async wrappers (`asyncio.to_thread`, tolerant `{"error": ...}`
+  on failure) plus the decision-driven `open_from_decision`: runs `decide_crypto`, sizes
+  `notional = account_equity * plan.notional_pct` (override `notional_usd`), leverage =
+  `plan.suggested_leverage`, side = plan direction, and (with `attach_tpsl`, the default) places
+  the plan's `stop_price`/`target_price` as the position's exchange-side TP/SL; an `AVOID`/flat
+  verdict places nothing.
+- `core/crypto_universe.fetch_hyperliquid_perps` — a **keyless** read of the exchange's own
+  listing (`POST /info {"type":"meta"}`; no key, no SDK), cached live→cache→`unavailable` (no
+  curated fallback). Powers two things: the `paper_pairs` listing, and **constraining
+  suggestions** — `screen_crypto(hyperliquid_only=True)` (the default) drops any universe symbol
+  whose base coin isn't a listed Hyperliquid perp, so the screener never surfaces an impossible
+  trade. Tolerant: an unavailable listing passes the universe through unchanged. Order placement
+  is the hard backstop — `open_position` validates the coin against `info.meta()` regardless.
+
+### 17.3 MCP + CLI surface
+
+- **Tools:** `paper_pairs` (list tradable testnet perps — **keyless**), and the order tools that
+  place REAL testnet orders and need `MCP_HL_PRIVATE_KEY`: `paper_account`, `paper_orders`
+  (open orders + recent fills), `paper_trade_decision` (decide + place + plan TP/SL;
+  `attach_tpsl=false` to skip), `paper_open` (optional `stop_loss`/`take_profit`),
+  `paper_set_tpsl` (attach/replace protection on an existing position), `paper_close`,
+  `paper_cancel`, `paper_set_leverage`.
+- **CLI:** `makecrazypenny --paper-pairs` (keyless), `--paper-account`,
+  `--paper-trade SYMBOL [--interval --leverage --notional]`,
+  `--paper-open SYMBOL --side LONG|SHORT (--size | --notional) [--leverage --limit-price
+  --stop-loss --take-profit]`, `--paper-set-tpsl SYMBOL [--stop-loss --take-profit --size]`,
+  `--paper-close SYMBOL [--size]`.
+
+### 17.4 Settings (env-overridable)
+
+`hyperliquid_testnet_url` (`MCP_HL_TESTNET_URL`), `hl_private_key` (`MCP_HL_PRIVATE_KEY`),
+`hl_account_address` (`MCP_HL_ACCOUNT_ADDRESS`, for API/agent wallets), `hl_default_slippage`
+(`MCP_HL_SLIPPAGE`, default 0.05). Symbols map to Hyperliquid coins via
+`core/symbols.to_hyperliquid_coin` (`BTCUSDT` → `BTC`). Install with `pip install
+'makecrazypenny[trade]'`; fund a testnet wallet at https://app.hyperliquid-testnet.xyz/drip.
+
+### 17.5 Operational notes (live-verified)
+
+A full round trip was exercised against the live testnet (`paper_pairs` → `paper_account` →
+`paper_open`/`paper_close` → `paper_trade_decision`). Two real-world facts the model surfaced and
+that the toolkit now accommodates:
+
+- **Agent (API) wallet vs master account.** A Hyperliquid **API/agent wallet** is authorized to
+  *trade* on behalf of a funded **master** account, but its own address holds no balance. If the
+  configured key is an agent, set `MCP_HL_ACCOUNT_ADDRESS` to the **master** address so reads
+  (`account_state`/positions/fills) hit the account the fills actually land in — otherwise orders
+  "fill" while the account looks empty. The exchange's `userRole` info call (`{"role":"agent",
+  "data":{"user":<master>}}`) reveals the master. **Agent wallets cannot move funds**:
+  `usd_class_transfer`/withdrawals are rejected (`"Must deposit before performing actions"`) and
+  must be signed by the master/owner wallet (or done in the testnet UI).
+- **Spot vs perp collateral.** USDC lives in separate **spot** and **perp** wallets; Hyperliquid
+  draws spot collateral into perp as a position needs it, so a flat perp account reads `$0` while
+  the funds sit in spot. `account_state` therefore also reports `spot_usdc` and a combined
+  `tradable_usdc` (perp equity + free spot), and `open_from_decision` sizes against
+  `tradable_usdc` so the decision path works when funds are in spot. Order placement still
+  validates the coin against `info.meta()` as the hard backstop.

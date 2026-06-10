@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from typing import Any
 
@@ -35,6 +36,8 @@ from .crypto_screen import screen_crypto as run_crypto_screen
 from .debate import decide as run_decision
 from .market import scan_sector as run_sector_scan
 from .screen import screen_market as run_market_screen
+from . import paper_trade
+from ..servers._common import json_default
 
 # Exit codes.
 EXIT_OK = 0
@@ -569,6 +572,101 @@ def _format_backtest(b: dict[str, Any]) -> str:
     ])
 
 
+def _format_pairs(p: dict[str, Any]) -> str:
+    """Render the tradable Hyperliquid perp listing as an ASCII block."""
+    if p.get("source") == "unavailable":
+        return "Hyperliquid perp listing unavailable (could not reach the testnet /info endpoint)."
+    coins = p.get("coins") or []
+    by_name = {
+        str(d.get("name")): d.get("max_leverage")
+        for d in (p.get("perps") or [])
+        if isinstance(d, dict)
+    }
+    lines = [
+        f"HYPERLIQUID TESTNET PERPS: {p.get('count', len(coins))} tradable "
+        f"({p.get('source', '?')}{', stale' if p.get('stale') else ''})",
+    ]
+    # Compact grid: COIN(maxlev) entries, a few per row.
+    cells = [f"{c}(x{by_name.get(c)})" if by_name.get(c) is not None else c for c in coins]
+    for i in range(0, len(cells), 6):
+        lines.append("  " + "  ".join(f"{x:<14}" for x in cells[i : i + 6]).rstrip())
+    return "\n".join(lines)
+
+
+def _format_account(a: dict[str, Any]) -> str:
+    """Render a testnet account-state dict as an ASCII block."""
+    if a.get("error"):
+        return f"Paper account unavailable: {a['error']}"
+    lines = [
+        f"PAPER ACCOUNT (Hyperliquid {a.get('network', 'testnet')}): {a.get('address', '?')}",
+        f"  Perp equity ${_to_num(a.get('account_value'))}   Spot USDC ${_to_num(a.get('spot_usdc'))}"
+        f"   Tradable ${_to_num(a.get('tradable_usdc'))}",
+        f"  Margin used ${_to_num(a.get('total_margin_used'))}   Withdrawable ${_to_num(a.get('withdrawable'))}",
+    ]
+    positions = a.get("positions") or []
+    if not positions:
+        lines.append("  Positions: (none)")
+    else:
+        lines.append("  Positions:")
+        for p in positions:
+            lines.append(
+                f"    {str(p.get('coin', '?')):<6} size {_to_num(p.get('size'))}  entry {_to_num(p.get('entry_price'))}"
+                f"  lev {_to_num(p.get('leverage'))}x  liq {_to_num(p.get('liquidation_price'))}"
+                f"  uPnL {_to_num(p.get('unrealized_pnl'))}"
+            )
+    return "\n".join(lines)
+
+
+def _to_num(v: Any) -> str:
+    """Format a numeric value compactly, tolerating ``None``."""
+    if v is None:
+        return "n/a"
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _format_paper_order(result: dict[str, Any], title: str) -> str:
+    """Render a paper open/close/decision result: a one-line summary + JSON detail."""
+    lines = [title]
+    if result.get("error"):
+        lines.append(f"  FAILED: {result['error']}")
+    elif "placed" in result and not result["placed"]:
+        lines.append(f"  NOT PLACED: {result.get('reason', 'no order')}")
+    else:
+        order = result.get("order") or result
+        coin = order.get("coin", result.get("symbol", "?"))
+        side = order.get("side", "?")
+        size = order.get("size")
+        notional = order.get("notional_usd")
+        status = (order.get("result") or {}).get("status", "?")
+        summary = f"  {side} {coin}  size {_to_num(size)}"
+        if notional is not None:
+            summary += f"  (~${_to_num(notional)})"
+        summary += f"  -> status {status}"
+        lines.append(summary)
+        sizing = result.get("sizing")
+        if isinstance(sizing, dict):
+            lines.append(
+                f"  Sized from engine: notional ${_to_num(sizing.get('notional_usd'))}"
+                f"  leverage {_to_num(sizing.get('leverage'))}x  (equity ${_to_num(sizing.get('equity'))})"
+            )
+        tpsl = order.get("tpsl") if isinstance(order.get("tpsl"), dict) else order
+        legs = tpsl.get("legs") if isinstance(tpsl, dict) else None
+        if isinstance(legs, dict) and legs:
+            parts = []
+            if isinstance(legs.get("stop_loss"), dict):
+                parts.append(f"SL @ {_to_num(legs['stop_loss'].get('trigger_price'))}")
+            if isinstance(legs.get("take_profit"), dict):
+                parts.append(f"TP @ {_to_num(legs['take_profit'].get('trigger_price'))}")
+            lines.append("  Protection (OCO triggers): " + ", ".join(parts))
+        elif isinstance(tpsl, dict) and tpsl.get("skipped"):
+            lines.append(f"  TP/SL skipped: {tpsl['skipped']}")
+    lines += ["", json.dumps(result, indent=2, default=json_default)]
+    return "\n".join(lines)
+
+
 def _normalize_symbol(symbol: str) -> str:
     """Uppercase, strip whitespace, and strip a leading ``$`` from a symbol."""
     cleaned = symbol.strip()
@@ -676,6 +774,89 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Walk-forward backtest of the price signals for SYMBOL (CAGR/Sharpe/maxDD + deflated Sharpe).",
     )
+    # --- Hyperliquid testnet paper trading (needs MCP_HL_PRIVATE_KEY) ---------
+    parser.add_argument(
+        "--paper-pairs",
+        action="store_true",
+        help="List the tradable Hyperliquid TESTNET perps (keyless) and exit.",
+    )
+    parser.add_argument(
+        "--paper-account",
+        action="store_true",
+        help="Show the Hyperliquid TESTNET paper account (equity, positions) and exit.",
+    )
+    parser.add_argument(
+        "--paper-trade",
+        metavar="SYMBOL",
+        default=None,
+        help=(
+            "Decide a crypto perp (like --crypto) and PLACE the sized order on the Hyperliquid "
+            "TESTNET. Uses --interval and --leverage; --notional overrides the engine sizing."
+        ),
+    )
+    parser.add_argument(
+        "--paper-open",
+        metavar="SYMBOL",
+        default=None,
+        help=(
+            "Manually open a TESTNET position. Use --side and --size or --notional "
+            "(+ --leverage, --limit-price, --stop-loss, --take-profit)."
+        ),
+    )
+    parser.add_argument(
+        "--paper-set-tpsl",
+        metavar="SYMBOL",
+        default=None,
+        help=(
+            "Attach exchange-side stop-loss/take-profit trigger orders (OCO) to an existing "
+            "TESTNET position. Use --stop-loss and/or --take-profit (+ optional --size)."
+        ),
+    )
+    parser.add_argument(
+        "--paper-close",
+        metavar="SYMBOL",
+        default=None,
+        help="Market-close a TESTNET position (all, or --size coin units).",
+    )
+    parser.add_argument(
+        "--side",
+        choices=("LONG", "SHORT", "long", "short", "BUY", "SELL", "buy", "sell"),
+        default=None,
+        help="Paper-open side (LONG/SHORT).",
+    )
+    parser.add_argument(
+        "--size",
+        type=float,
+        default=None,
+        help="Paper order size in coin units (alternative to --notional).",
+    )
+    parser.add_argument(
+        "--notional",
+        type=float,
+        default=None,
+        help="Paper order notional in USD (alternative to --size).",
+    )
+    parser.add_argument(
+        "--limit-price",
+        type=float,
+        default=None,
+        dest="limit_price",
+        help="Paper limit-order price (omit for a market order).",
+    )
+    parser.add_argument(
+        "--stop-loss",
+        type=float,
+        default=None,
+        dest="stop_loss",
+        help="Stop-loss trigger price for --paper-open / --paper-set-tpsl (exchange-side, reduce-only).",
+    )
+    parser.add_argument(
+        "--take-profit",
+        type=float,
+        default=None,
+        dest="take_profit",
+        help="Take-profit trigger price for --paper-open / --paper-set-tpsl (exchange-side, reduce-only).",
+    )
     parser.add_argument(
         "--mode",
         choices=("decide", "report"),
@@ -713,6 +894,98 @@ def cli(argv: list[str] | None = None) -> int:
             pass
 
     args = _parse_args(argv)
+
+    # --- Paper trading on the Hyperliquid testnet (needs MCP_HL_PRIVATE_KEY) --
+    if args.paper_pairs:
+        try:
+            result = asyncio.run(paper_trade.available_pairs())
+            output = _format_pairs(result)
+        except Exception as exc:
+            print(f"Error: pair listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    if args.paper_account:
+        try:
+            result = asyncio.run(paper_trade.account())
+            output = _format_account(result)
+        except Exception as exc:
+            print(f"Error: paper account lookup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    if args.paper_trade:
+        sym = canonical_crypto(args.paper_trade)
+        try:
+            result = asyncio.run(
+                paper_trade.open_from_decision(
+                    sym, interval=args.interval, leverage_cap=args.leverage or 20.0,
+                    notional_usd=args.notional,
+                )
+            )
+            output = _format_paper_order(result, f"PAPER TRADE (decision-driven): {sym}")
+        except Exception as exc:
+            print(f"Error: paper trade failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    if args.paper_open:
+        if not args.side:
+            print("Error: --paper-open needs --side LONG|SHORT.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        if args.size is None and args.notional is None:
+            print("Error: --paper-open needs --size or --notional.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        sym = canonical_crypto(args.paper_open)
+        try:
+            result = asyncio.run(
+                paper_trade.open_manual(
+                    sym, args.side, size=args.size, notional_usd=args.notional,
+                    leverage=args.leverage,
+                    order_type="limit" if args.limit_price is not None else "market",
+                    limit_price=args.limit_price,
+                    stop_loss=args.stop_loss,
+                    take_profit=args.take_profit,
+                )
+            )
+            output = _format_paper_order(result, f"PAPER OPEN: {sym}")
+        except Exception as exc:
+            print(f"Error: paper open failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    if args.paper_set_tpsl:
+        if args.stop_loss is None and args.take_profit is None:
+            print("Error: --paper-set-tpsl needs --stop-loss and/or --take-profit.", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        sym = canonical_crypto(args.paper_set_tpsl)
+        try:
+            result = asyncio.run(
+                paper_trade.set_tpsl(
+                    sym, stop_loss=args.stop_loss, take_profit=args.take_profit, size=args.size
+                )
+            )
+            output = _format_paper_order(result, f"PAPER SET TP/SL: {sym}")
+        except Exception as exc:
+            print(f"Error: paper set-tpsl failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
+
+    if args.paper_close:
+        sym = canonical_crypto(args.paper_close)
+        try:
+            result = asyncio.run(paper_trade.close(sym, args.size))
+            output = _format_paper_order(result, f"PAPER CLOSE: {sym}")
+        except Exception as exc:
+            print(f"Error: paper close failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        print(with_disclaimer(output))
+        return EXIT_OK
 
     # --- Crypto regime (no symbol needed) ------------------------------------
     if args.crypto_regime:

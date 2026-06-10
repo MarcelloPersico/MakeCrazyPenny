@@ -64,6 +64,7 @@ from .orchestration.debate import (
     gather_evidence,
     score_evidence,
 )
+from .orchestration import paper_trade
 from .orchestration.market import scan_sector
 from .orchestration.portfolio import build_portfolio, build_sector_portfolio
 from .orchestration.screen import screen_market
@@ -75,7 +76,9 @@ mcp = FastMCP(
         "Autonomous stock trade-decision toolkit. To decide whether to BUY (go "
         "long), SHORT, or AVOID a symbol, use the `decide` prompt — it runs a "
         "bull-vs-bear debate and an orchestrator judgment using these tools for "
-        "evidence. Tools are deterministic and require no API key. Informational "
+        "evidence. Tools are deterministic and require no API key. The `paper_*` "
+        "tools are the one exception: they place REAL orders on the Hyperliquid "
+        "TESTNET (paper money) and require MCP_HL_PRIVATE_KEY. Informational "
         "only; NOT investment advice."
     ),
 )
@@ -576,6 +579,196 @@ async def crypto_finalize_decision_tool(
         decision, dossier, interval=interval, leverage_cap=leverage_cap
     )
     return _dumps(decision.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Paper-trading tools (Hyperliquid TESTNET; authenticated, state-mutating)
+# ---------------------------------------------------------------------------
+# These are the only tools that place orders. They act on the Hyperliquid testnet
+# (paper money) and need MCP_HL_PRIVATE_KEY set to a funded testnet wallet's key.
+# Mainnet is never used. See CONTRACT.md §17.
+
+
+@mcp.tool(
+    name="paper_pairs",
+    title="List tradable Hyperliquid testnet perps",
+    description=(
+        "List the coins actually tradable as perpetuals on the Hyperliquid testnet (with each "
+        "coin's max leverage). KEYLESS — needs no MCP_HL_PRIVATE_KEY. Use it to confirm a symbol is "
+        "tradable before deciding/placing so you never chase an impossible trade; the crypto screener "
+        "already restricts its suggestions to this set."
+    ),
+)
+async def paper_pairs_tool() -> str:
+    """Return the tradable Hyperliquid testnet perp listing as JSON."""
+    return _dumps(await paper_trade.available_pairs())
+
+
+@mcp.tool(
+    name="paper_account",
+    title="Paper account state (Hyperliquid testnet)",
+    description=(
+        "Testnet account snapshot: equity (account value), margin used, withdrawable, and open "
+        "positions (size, entry, leverage, liquidation price, unrealized PnL). Read-only. Requires "
+        "MCP_HL_PRIVATE_KEY (a funded Hyperliquid TESTNET wallet)."
+    ),
+)
+async def paper_account_tool() -> str:
+    """Return the testnet account state as JSON."""
+    return _dumps(await paper_trade.account())
+
+
+@mcp.tool(
+    name="paper_orders",
+    title="Paper open orders + recent fills (testnet)",
+    description=(
+        "Currently resting testnet orders plus the most recent fills. Read-only. `fills_limit` caps "
+        "how many fills to return (default 20). Requires MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_orders_tool(fills_limit: int = 20) -> str:
+    """Return open orders and recent fills as JSON."""
+    orders, fills = await _safe_gather(
+        paper_trade.open_orders(), paper_trade.recent_fills(fills_limit)
+    )
+    return _dumps({"open_orders": orders, "fills": fills})
+
+
+@mcp.tool(
+    name="paper_trade_decision",
+    title="Decide + place a paper trade (testnet)",
+    description=(
+        "Run the leverage-aware crypto engine for a symbol (same as crypto_decide) and PLACE the "
+        "resulting trade on the Hyperliquid testnet. Sizes the order from the engine's own leverage "
+        "plan: notional = account equity * plan notional_pct (override with notional_usd), leverage "
+        "= plan suggested leverage, side = plan direction; the plan's stop/target are also placed as "
+        "exchange-side OCO stop-loss/take-profit trigger orders (disable with attach_tpsl=false). An "
+        "AVOID/flat verdict places no order and returns the analysis with a reason. Places REAL "
+        "testnet (paper) orders. Requires MCP_HL_PRIVATE_KEY. `interval` = entry timeframe; "
+        "`leverage_cap` caps suggested leverage."
+    ),
+)
+async def paper_trade_decision_tool(
+    symbol: str,
+    interval: str = "15m",
+    leverage_cap: float = 20.0,
+    notional_usd: float | None = None,
+    attach_tpsl: bool = True,
+) -> str:
+    """Decide then place the sized order (+ plan TP/SL) on testnet; return the combined result as JSON."""
+    sym = canonical_crypto(symbol)
+    result = await paper_trade.open_from_decision(
+        sym,
+        interval=interval,
+        leverage_cap=leverage_cap,
+        notional_usd=notional_usd,
+        attach_tpsl=attach_tpsl,
+    )
+    return _dumps(result)
+
+
+@mcp.tool(
+    name="paper_open",
+    title="Open a paper position (testnet)",
+    description=(
+        "Manually open (or add to) a position on the Hyperliquid testnet. Provide EITHER `size` (in "
+        "coin units) OR `notional_usd` (sized at the reference price). `side` is LONG/SHORT (or "
+        "BUY/SELL). `order_type` is 'market' (default; IOC at mid +/- slippage) or 'limit' (needs "
+        "`limit_price`, rests GTC). `leverage`, if given, is set first. `stop_loss`/`take_profit`, "
+        "if given, are attached as exchange-side OCO trigger orders once the entry fills. Places a "
+        "REAL testnet (paper) order. Requires MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_open_tool(
+    symbol: str,
+    side: str,
+    size: float | None = None,
+    notional_usd: float | None = None,
+    leverage: float | None = None,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    reduce_only: bool = False,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+) -> str:
+    """Place a manual paper order (optionally with TP/SL); return the result as JSON."""
+    result = await paper_trade.open_manual(
+        canonical_crypto(symbol),
+        side,
+        size=size,
+        notional_usd=notional_usd,
+        leverage=leverage,
+        order_type=order_type,
+        limit_price=limit_price,
+        reduce_only=reduce_only,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+    return _dumps(result)
+
+
+@mcp.tool(
+    name="paper_set_tpsl",
+    title="Attach stop-loss / take-profit to a position (testnet)",
+    description=(
+        "Attach a reduce-only stop-loss and/or take-profit TRIGGER order to an EXISTING testnet "
+        "position. The legs live on the exchange (they fire even with no client connected) and are "
+        "OCO-grouped to the position: one executing cancels the other. `size` defaults to the full "
+        "position; triggers on the wrong side of the current price are rejected. Re-running replaces "
+        "nothing - cancel old legs first via paper_cancel (oids from paper_orders). Requires "
+        "MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_set_tpsl_tool(
+    symbol: str,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    size: float | None = None,
+) -> str:
+    """Attach SL/TP trigger orders to an open testnet position; return the result as JSON."""
+    result = await paper_trade.set_tpsl(
+        canonical_crypto(symbol), stop_loss=stop_loss, take_profit=take_profit, size=size
+    )
+    return _dumps(result)
+
+
+@mcp.tool(
+    name="paper_close",
+    title="Close a paper position (testnet)",
+    description=(
+        "Market-close all (or `size` coin units) of a testnet position. Places a REAL testnet (paper) "
+        "reduce order. Requires MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_close_tool(symbol: str, size: float | None = None) -> str:
+    """Close a testnet position; return the result as JSON."""
+    return _dumps(await paper_trade.close(canonical_crypto(symbol), size))
+
+
+@mcp.tool(
+    name="paper_cancel",
+    title="Cancel a resting paper order (testnet)",
+    description=(
+        "Cancel a resting testnet order by symbol + order id (oid, from paper_orders). Requires "
+        "MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_cancel_tool(symbol: str, oid: int) -> str:
+    """Cancel a resting testnet order; return the result as JSON."""
+    return _dumps(await paper_trade.cancel(canonical_crypto(symbol), oid))
+
+
+@mcp.tool(
+    name="paper_set_leverage",
+    title="Set leverage for a symbol (testnet)",
+    description=(
+        "Set the leverage used for a symbol on the testnet (capped to the coin's max). `cross` selects "
+        "cross (default) vs isolated margin. Requires MCP_HL_PRIVATE_KEY."
+    ),
+)
+async def paper_set_leverage_tool(symbol: str, leverage: float, cross: bool = True) -> str:
+    """Set leverage on testnet; return the result as JSON."""
+    return _dumps(await paper_trade.set_leverage(canonical_crypto(symbol), leverage, cross))
 
 
 async def _safe_gather(*coros: Any) -> list[Any]:

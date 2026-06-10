@@ -28,6 +28,10 @@ from .symbols import MAJOR_CRYPTO_BASES
 
 #: Cache filename (under the resolved cache dir) for the ranked perp list.
 _CACHE_FILE = "crypto_universe.json"
+#: Cache filename for the Hyperliquid testnet perp listing (the tradable set).
+_HL_CACHE_FILE = "hyperliquid_perps.json"
+#: Hyperliquid listing changes rarely; refresh ~daily.
+_HL_CACHE_TTL_SECONDS = 24 * 3600
 #: Refresh at most ~daily; top-volume membership shifts slowly day to day.
 _CACHE_TTL_SECONDS = 24 * 3600
 #: HTTP timeout for the (single) universe fetch.
@@ -184,6 +188,117 @@ def _fetch_blocking(settings: Settings | None, limit: int, force_refresh: bool) 
     return _slice(_fallback(), "fallback", limit, stale=False)
 
 
+# ---------------------------------------------------------------------------
+# Hyperliquid tradable perp listing (keyless) — used to avoid suggesting trades
+# in coins that aren't actually listed on the exchange we paper-trade on.
+# ---------------------------------------------------------------------------
+
+
+def _fetch_live_hyperliquid(base_url: str) -> list[dict[str, Any]] | None:
+    """Fetch the Hyperliquid perp universe via the keyless ``/info`` meta call.
+
+    Returns a list of ``{"name", "sz_decimals", "max_leverage"}`` for every
+    non-delisted perp, or ``None`` on any failure. No API key and no SDK — a plain
+    JSON POST, so this works even without the optional ``trade`` extra installed.
+    """
+    try:
+        import httpx  # lazy import
+    except ImportError:
+        return None
+    try:
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/info", json={"type": "meta"}, timeout=_FETCH_TIMEOUT_S
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception:
+        return None
+    universe = body.get("universe") if isinstance(body, dict) else None
+    if not isinstance(universe, list):
+        return None
+    perps: list[dict[str, Any]] = []
+    for asset in universe:
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        if not name or asset.get("isDelisted"):
+            continue
+        perps.append(
+            {
+                "name": str(name),
+                "sz_decimals": asset.get("szDecimals"),
+                "max_leverage": asset.get("maxLeverage"),
+            }
+        )
+    return perps or None
+
+
+def _read_hl_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("perps"):
+        return None
+    return data
+
+
+def _hl_result(doc: dict[str, Any], source: str, *, stale: bool) -> dict[str, Any]:
+    """Shape a Hyperliquid listing doc into the public result (with a coin set)."""
+    perps = [p for p in doc.get("perps", []) if isinstance(p, dict) and p.get("name")]
+    coins = sorted({str(p["name"]) for p in perps})
+    return {
+        "coins": coins,
+        "perps": perps,
+        "count": len(coins),
+        "source": source,
+        "as_of": doc.get("as_of"),
+        "stale": stale,
+    }
+
+
+async def fetch_hyperliquid_perps(
+    *, settings: Settings | None = None, force_refresh: bool = False
+) -> dict[str, Any]:
+    """Return the **tradable Hyperliquid testnet perps** (live -> cache -> unavailable).
+
+    A keyless read of the exchange's own listing, used to constrain suggestions to
+    coins you can actually trade. Resolution mirrors :func:`fetch_top_perps`, but
+    there is **no curated fallback**: if the live listing can't be fetched and no
+    cache exists, ``source`` is ``"unavailable"`` and ``coins`` is empty, which
+    callers treat as "don't filter" (better to suggest than to wrongly suppress).
+    Blocking work runs in a worker thread; never raises.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(_fetch_hl_blocking, settings, force_refresh)
+
+
+def _fetch_hl_blocking(settings: Settings | None, force_refresh: bool) -> dict[str, Any]:
+    """Synchronous core of :func:`fetch_hyperliquid_perps`."""
+    settings = settings or Settings.from_env()
+    cache_path = settings.resolve_cache_dir() / _HL_CACHE_FILE
+    now = time.time()
+
+    cached = _read_hl_cache(cache_path)
+    if cached and not force_refresh:
+        fetched_at = float(cached.get("fetched_at", 0.0) or 0.0)
+        if now - fetched_at < _HL_CACHE_TTL_SECONDS:
+            return _hl_result(cached, "cache", stale=False)
+
+    perps = _fetch_live_hyperliquid(settings.hyperliquid_testnet_url)
+    if perps:
+        doc = {"perps": perps, "fetched_at": now, "as_of": _iso(now)}
+        _write_cache(cache_path, doc)
+        return _hl_result(doc, "live", stale=False)
+
+    if cached:
+        return _hl_result(cached, "cache", stale=True)
+
+    return {"coins": [], "perps": [], "count": 0, "source": "unavailable", "as_of": None, "stale": False}
+
+
 def _slice(doc: dict[str, Any], source: str, limit: int, *, stale: bool) -> dict[str, Any]:
     """Return a result dict sliced to ``limit`` and tagged with its source."""
     symbols = list(doc.get("symbols", []))[: max(1, limit)]
@@ -197,4 +312,4 @@ def _slice(doc: dict[str, Any], source: str, limit: int, *, stale: bool) -> dict
     }
 
 
-__all__ = ["fetch_top_perps"]
+__all__ = ["fetch_top_perps", "fetch_hyperliquid_perps"]

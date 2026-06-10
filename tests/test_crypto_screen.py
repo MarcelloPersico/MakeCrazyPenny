@@ -10,6 +10,11 @@ from makecrazypenny.core.types import TradeDecision
 from makecrazypenny.orchestration import crypto_screen as cs
 
 
+async def _hl_unavailable(*, settings: Any = None, force_refresh: bool = False) -> dict[str, Any]:
+    """Hyperliquid listing unavailable -> the screener does not filter."""
+    return {"coins": [], "perps": [], "count": 0, "source": "unavailable"}
+
+
 def _decision(symbol: str, action: str, conviction: float, net: float) -> TradeDecision:
     direction = {"BUY": "LONG", "SHORT": "SHORT", "AVOID": "FLAT"}[action]
     return TradeDecision(
@@ -58,6 +63,7 @@ async def test_screen_crypto_selects_longs_and_shorts(monkeypatch: pytest.Monkey
         return verdicts[symbol]
 
     monkeypatch.setattr(cs, "fetch_top_perps", fake_top)
+    monkeypatch.setattr(cs, "fetch_hyperliquid_perps", _hl_unavailable)
     monkeypatch.setattr(cs, "_prefilter_factors", fake_prefilter)
     monkeypatch.setattr(cs, "crypto_regime", fake_regime)
     monkeypatch.setattr(cs, "decide_crypto", fake_decide)
@@ -96,6 +102,7 @@ async def test_screen_crypto_tolerates_deep_dive_failure(monkeypatch: pytest.Mon
         return _decision("AUSDT", "BUY", 0.5, 3.0)
 
     monkeypatch.setattr(cs, "fetch_top_perps", fake_top)
+    monkeypatch.setattr(cs, "fetch_hyperliquid_perps", _hl_unavailable)
     monkeypatch.setattr(cs, "_prefilter_factors", fake_prefilter)
     monkeypatch.setattr(cs, "crypto_regime", fake_regime)
     monkeypatch.setattr(cs, "decide_crypto", fake_decide)
@@ -104,3 +111,65 @@ async def test_screen_crypto_tolerates_deep_dive_failure(monkeypatch: pytest.Mon
     d = screen.to_dict()
     assert any(e.get("symbol") == "BUSDT" for e in d["errors"])
     assert [x["symbol"] for x in d["top_longs"]] == ["AUSDT"]
+
+
+async def test_screen_crypto_filters_to_hyperliquid(monkeypatch: pytest.MonkeyPatch) -> None:
+    # FOO is liquid on Binance but NOT listed on Hyperliquid -> must be dropped.
+    universe = ["BTCUSDT", "ETHUSDT", "FOOUSDT"]
+
+    async def fake_top(*, settings: Any = None, limit: int = 40, force_refresh: bool = False) -> dict[str, Any]:
+        return {"symbols": universe, "count": len(universe), "source": "live", "as_of": None}
+
+    async def fake_hl(*, settings: Any = None, force_refresh: bool = False) -> dict[str, Any]:
+        return {"coins": ["BTC", "ETH"], "perps": [], "count": 2, "source": "live"}
+
+    async def fake_prefilter(symbol: str, interval: str) -> dict[str, Any]:
+        return {"momentum_12_1": 0.2, "trend_200": 0.05, "pct_52w_high": 0.95}
+
+    async def fake_regime(*, settings: Any = None) -> dict[str, Any]:
+        return {"regime": "risk_on", "gross_exposure": 1.0}
+
+    seen: list[str] = []
+
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+        seen.append(symbol)
+        return _decision(symbol, "BUY", 0.5, 3.0)
+
+    monkeypatch.setattr(cs, "fetch_top_perps", fake_top)
+    monkeypatch.setattr(cs, "fetch_hyperliquid_perps", fake_hl)
+    monkeypatch.setattr(cs, "_prefilter_factors", fake_prefilter)
+    monkeypatch.setattr(cs, "crypto_regime", fake_regime)
+    monkeypatch.setattr(cs, "decide_crypto", fake_decide)
+
+    screen = await cs.screen_crypto(interval="15m")
+    d = screen.to_dict()
+    # The non-Hyperliquid coin is never analyzed or surfaced.
+    assert "FOOUSDT" not in seen and set(seen) <= {"BTCUSDT", "ETHUSDT"}
+    assert all(x["symbol"] != "FOOUSDT" for x in d["top_longs"])
+    assert "Hyperliquid-listed" in d["summary"]
+
+
+async def test_screen_crypto_hyperliquid_only_false_skips_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_top(*, settings: Any = None, limit: int = 40, force_refresh: bool = False) -> dict[str, Any]:
+        return {"symbols": ["FOOUSDT"], "count": 1, "source": "live", "as_of": None}
+
+    async def boom_hl(*, settings: Any = None, force_refresh: bool = False) -> dict[str, Any]:
+        raise AssertionError("hyperliquid_only=False must not fetch the listing")
+
+    async def fake_prefilter(symbol: str, interval: str) -> dict[str, Any]:
+        return {"momentum_12_1": 0.2, "trend_200": 0.05, "pct_52w_high": 0.95}
+
+    async def fake_regime(*, settings: Any = None) -> dict[str, Any]:
+        return {"regime": "risk_on", "gross_exposure": 1.0}
+
+    async def fake_decide(symbol: str, *, interval: str = "15m", leverage_cap: Any = None, settings: Any = None) -> TradeDecision:
+        return _decision(symbol, "BUY", 0.5, 3.0)
+
+    monkeypatch.setattr(cs, "fetch_top_perps", fake_top)
+    monkeypatch.setattr(cs, "fetch_hyperliquid_perps", boom_hl)
+    monkeypatch.setattr(cs, "_prefilter_factors", fake_prefilter)
+    monkeypatch.setattr(cs, "crypto_regime", fake_regime)
+    monkeypatch.setattr(cs, "decide_crypto", fake_decide)
+
+    screen = await cs.screen_crypto(interval="15m", hyperliquid_only=False)
+    assert [x["symbol"] for x in screen.to_dict()["top_longs"]] == ["FOOUSDT"]

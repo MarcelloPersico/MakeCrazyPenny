@@ -22,6 +22,11 @@ _SCRUBBED_ENV_VARS = (
     "MCP_CAPABILITY_CHAINS",
     "MCP_EDGAR_USER_AGENT",
     "MCP_L2_CACHE",
+    # Execution layer (CONTRACT.md §17): never read a real wallet key in tests.
+    "MCP_HL_PRIVATE_KEY",
+    "MCP_HL_ACCOUNT_ADDRESS",
+    "MCP_HL_TESTNET_URL",
+    "MCP_HL_SLIPPAGE",
 )
 
 

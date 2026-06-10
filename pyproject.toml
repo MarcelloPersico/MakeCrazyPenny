@@ -33,6 +33,12 @@ dependencies = [
 ui = [
     "streamlit>=1.30",
 ]
+# Hyperliquid TESTNET paper trading (CONTRACT.md §17). The only authenticated,
+# state-mutating path; pulls eth-account for EIP-712 signing. Optional — the
+# package imports and the offline test suite run without it.
+trade = [
+    "hyperliquid-python-sdk",
+]
 dev = [
     "pytest",
     "pytest-asyncio",

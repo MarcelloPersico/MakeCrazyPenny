@@ -56,3 +56,33 @@ async def test_bybit_fallback_used_when_binance_none(monkeypatch: pytest.MonkeyP
     result = await U.fetch_top_perps(settings=settings, limit=10)
     assert result["source"] == "live"
     assert result["symbols"] == ["XRPUSDT", "DOGEUSDT"]
+
+
+# --- Hyperliquid tradable perp listing (CONTRACT.md §17) -----------------------
+
+
+async def test_hyperliquid_live_then_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    perps = [
+        {"name": "ETH", "sz_decimals": 2, "max_leverage": 50},
+        {"name": "BTC", "sz_decimals": 3, "max_leverage": 50},
+    ]
+    monkeypatch.setattr(U, "_fetch_live_hyperliquid", lambda base: perps)
+
+    live = await U.fetch_hyperliquid_perps(settings=settings)
+    assert live["source"] == "live"
+    assert live["coins"] == ["BTC", "ETH"]  # sorted
+    assert live["count"] == 2
+
+    # Live now fails, but a fresh cache was written -> served from cache.
+    monkeypatch.setattr(U, "_fetch_live_hyperliquid", lambda base: None)
+    cached = await U.fetch_hyperliquid_perps(settings=settings)
+    assert cached["source"] == "cache" and cached["coins"] == ["BTC", "ETH"]
+
+
+async def test_hyperliquid_unavailable_when_no_live_no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    monkeypatch.setattr(U, "_fetch_live_hyperliquid", lambda base: None)
+    res = await U.fetch_hyperliquid_perps(settings=settings)
+    # No curated fallback: callers treat 'unavailable' as "don't filter".
+    assert res["source"] == "unavailable" and res["coins"] == []

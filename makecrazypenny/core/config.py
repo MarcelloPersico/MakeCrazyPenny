@@ -195,6 +195,21 @@ class Settings:
     binance_base_url: str = "https://fapi.binance.com"
     bybit_base_url: str = "https://api.bybit.com"
 
+    #: Hyperliquid **testnet** paper-trading (CONTRACT.md §17). This is the only
+    #: authenticated, state-mutating path in the toolkit. It is intentionally
+    #: locked to testnet — there is no mainnet base URL field, so no amount of
+    #: misconfiguration can route a signed order at real funds.
+    hyperliquid_testnet_url: str = "https://api.hyperliquid-testnet.xyz"
+    #: Wallet private key used to SIGN testnet orders (``MCP_HL_PRIVATE_KEY``).
+    #: A secret — never logged; error strings are routed through ``redact_secrets``.
+    hl_private_key: str | None = None
+    #: Optional funded account/vault address when signing with an API/agent wallet
+    #: whose address differs from the signer's (``MCP_HL_ACCOUNT_ADDRESS``).
+    #: Defaults to the signer key's own address when unset.
+    hl_account_address: str | None = None
+    #: Default market-order slippage cap (fraction) for paper market orders.
+    hl_default_slippage: float = 0.05
+
     #: Crypto leverage-risk policy (informational sizing; tunable per §16). The
     #: defaults below are the "aggressive" preset chosen at build time.
     crypto_max_leverage: float = 20.0
@@ -246,6 +261,7 @@ class Settings:
             "FMP_API_KEY": self.fmp_api_key,
             "MARKETAUX_API_KEY": self.marketaux_api_key,
             "COINGECKO_API_KEY": self.coingecko_api_key,
+            "MCP_HL_PRIVATE_KEY": self.hl_private_key,
         }
         if env_var in mapping:
             # A known key: the injected Settings is authoritative. An explicit
@@ -305,6 +321,12 @@ class Settings:
             coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
             binance_base_url=os.environ.get("MCP_BINANCE_BASE_URL") or "https://fapi.binance.com",
             bybit_base_url=os.environ.get("MCP_BYBIT_BASE_URL") or "https://api.bybit.com",
+            hyperliquid_testnet_url=(
+                os.environ.get("MCP_HL_TESTNET_URL") or "https://api.hyperliquid-testnet.xyz"
+            ),
+            hl_private_key=os.environ.get("MCP_HL_PRIVATE_KEY") or None,
+            hl_account_address=os.environ.get("MCP_HL_ACCOUNT_ADDRESS") or None,
+            hl_default_slippage=_float_env("MCP_HL_SLIPPAGE", 0.05),
             crypto_max_leverage=_float_env("MCP_CRYPTO_MAX_LEVERAGE", 20.0),
             crypto_risk_per_trade=_float_env("MCP_CRYPTO_RISK_PER_TRADE", 0.025),
             crypto_maint_margin_rate=_float_env("MCP_CRYPTO_MAINT_MARGIN", 0.005),

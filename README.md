@@ -282,6 +282,52 @@ New MCP **tools** — `crypto_decide`, `crypto_evidence`, `derivatives`, `fundin
 > Leverage amplifies losses and liquidation prices are estimates. Informational only;
 > NOT investment advice.
 
+## Paper trade on the Hyperliquid testnet
+
+Turn a decision into an actual order — on the **Hyperliquid testnet** (paper money, no
+real funds). This is the only authenticated, order-placing path; everything else is
+read-only. It is **locked to testnet** (there is no mainnet option anywhere in the code),
+imports the Hyperliquid SDK lazily, and never logs your key.
+
+```bash
+pip install 'makecrazypenny[trade]'          # adds hyperliquid-python-sdk + eth-account
+
+# 1. Fund a TESTNET wallet for free: https://app.hyperliquid-testnet.xyz/drip
+# 2. Export its private key (testnet only — never a key with real funds):
+export MCP_HL_PRIVATE_KEY=0x...               # (Windows: setx MCP_HL_PRIVATE_KEY 0x...)
+
+makecrazypenny --paper-pairs                  # tradable testnet perps (keyless, no key needed)
+makecrazypenny --paper-account                # equity + open positions
+makecrazypenny --paper-trade BTC --interval 15m   # decide + place the engine-sized order (+ its stop/target)
+makecrazypenny --paper-open ETH --side LONG --notional 100 --leverage 5 --stop-loss 1500 --take-profit 1900
+makecrazypenny --paper-set-tpsl ETH --stop-loss 1550   # protect an already-open position
+makecrazypenny --paper-close ETH
+```
+
+So you're never shown an impossible trade, the crypto screener (`--crypto-market`,
+`crypto_screen`) restricts its suggestions to coins actually listed on the Hyperliquid
+testnet — fetched keylessly from the exchange's own listing — and order placement
+validates the coin one more time before sending. `--paper-pairs` / the `paper_pairs`
+tool list that tradable set (with each coin's max leverage) and need no key.
+
+`--paper-trade` runs the same leverage-aware crypto engine and sizes the order straight
+from its plan: notional = account equity x the plan's `notional_pct`, leverage = the
+plan's suggested leverage, side = the plan direction (an `AVOID`/flat verdict places
+nothing). Override the size with `--notional`. The plan's stop/target are also placed as
+**exchange-side stop-loss/take-profit trigger orders**, OCO-linked to the position
+(one firing cancels the other) — so the engine's invalidation protects the trade even
+after you disconnect. The same protection is available manually: `--stop-loss` /
+`--take-profit` on `--paper-open`, or `--paper-set-tpsl` for a position that is already
+open. Triggers on the wrong side of the market (a stop that would fire instantly) are
+rejected before anything is sent.
+
+New MCP **tools**: `paper_pairs` (list tradable testnet perps — **keyless**), plus the
+order tools that place a **real testnet** order and need `MCP_HL_PRIVATE_KEY`:
+`paper_account`, `paper_orders`, `paper_trade_decision`, `paper_open`, `paper_set_tpsl`,
+`paper_close`, `paper_cancel`, `paper_set_leverage`.
+
+> Testnet only — paper money. Still informational/educational; NOT investment advice.
+
 ## Run the dashboard (Streamlit GUI)
 
 A single-page web dashboard renders everything for one ticker — the `cross_check`

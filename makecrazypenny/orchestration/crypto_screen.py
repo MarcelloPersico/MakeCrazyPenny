@@ -26,9 +26,9 @@ from typing import Any
 from ..analysis.crypto_regime import crypto_regime
 from ..analysis.factors import factor_values
 from ..core.config import Settings
-from ..core.crypto_universe import fetch_top_perps
+from ..core.crypto_universe import fetch_hyperliquid_perps, fetch_top_perps
 from ..core.disclaimer import DISCLAIMER
-from ..core.symbols import canonical_crypto
+from ..core.symbols import base_asset, canonical_crypto
 from ..core.types import MarketScreen
 from .crypto import decide_crypto, factor_saturations, periods_per_year
 from .screen import prefilter_score
@@ -122,6 +122,30 @@ def _summary_line(source: str, count: int, interval: str, n_long: int, n_short: 
     )
 
 
+async def _filter_to_hyperliquid(
+    symbols: list[str], *, settings: Settings | None
+) -> tuple[list[str], str]:
+    """Drop symbols whose base coin isn't a tradable Hyperliquid perp.
+
+    Returns ``(kept, note)``. Tolerant: if the Hyperliquid listing is unavailable
+    the universe passes through unchanged (better to suggest than to wrongly
+    suppress). A filter that would empty the universe is also skipped as a safety
+    net. The match is by base asset against the exchange's own coin names, so it is
+    deliberately conservative (e.g. a coin Hyperliquid lists under a ``k``-prefixed
+    name won't match its plain base — under-suggesting beats suggesting the impossible).
+    """
+    listing = await fetch_hyperliquid_perps(settings=settings)
+    coins = set(listing.get("coins") or [])
+    if not coins:
+        return symbols, ""  # unavailable -> don't filter
+    kept = [s for s in symbols if base_asset(s) in coins]
+    dropped = len(symbols) - len(kept)
+    if not kept:
+        return symbols, ""  # would suppress everything -> skip the filter
+    note = f" (filtered to {len(kept)} Hyperliquid-listed perp(s); dropped {dropped} not on Hyperliquid)" if dropped else ""
+    return kept, note
+
+
 async def screen_crypto(
     *,
     symbols: list[str] | None = None,
@@ -131,6 +155,7 @@ async def screen_crypto(
     universe_limit: int = DEFAULT_UNIVERSE_LIMIT,
     leverage_cap: float | None = None,
     force_refresh: bool = False,
+    hyperliquid_only: bool = True,
     settings: Settings | None = None,
 ) -> MarketScreen:
     """Screen the crypto perp universe and return the best long/short setups.
@@ -143,6 +168,10 @@ async def screen_crypto(
         universe_limit: How many top perps to pull when fetching the universe.
         leverage_cap: Optional per-call leverage ceiling override.
         force_refresh: Bypass the cached universe and refetch it live.
+        hyperliquid_only: Keep only coins listed as tradable perps on the
+            Hyperliquid testnet (the venue we paper-trade on), so the screen never
+            surfaces an impossible trade. Tolerant: passes through unchanged if the
+            listing can't be fetched. Default ``True``.
         settings: Optional settings (defaults to ``Settings.from_env()``).
 
     Returns:
@@ -160,6 +189,11 @@ async def screen_crypto(
         source = str(uni.get("source", "unknown"))
         count = int(uni.get("count", len(universe_syms)))
         as_of = uni.get("as_of")
+
+    hl_note = ""
+    if hyperliquid_only and universe_syms:
+        universe_syms, hl_note = await _filter_to_hyperliquid(universe_syms, settings=settings)
+        count = len(universe_syms)
 
     if not universe_syms:
         return MarketScreen(
@@ -213,7 +247,7 @@ async def screen_crypto(
         short_shortlist=short_candidates,
         errors=(pre_errors + deep_errors)[:25],
         method="quant",
-        summary=_summary_line(source, count, interval, len(buys), len(shorts)),
+        summary=_summary_line(source, count, interval, len(buys), len(shorts)) + hl_note,
         disclaimer=DISCLAIMER,
     )
 

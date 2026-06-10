@@ -87,6 +87,16 @@ def to_bybit_perp(symbol: str) -> str:
     return canonical_crypto(symbol)
 
 
+def to_hyperliquid_coin(symbol: str) -> str:
+    """Format ``symbol`` as a Hyperliquid perpetual coin name (``BTC``, ``ETH``).
+
+    Hyperliquid identifies a perpetual by the bare base asset, not the joined
+    ``BASEQUOTE`` form the centralized exchanges use — so this returns just the
+    base (``BTC/USDT`` / ``BTCUSDT`` / ``BTC`` all map to ``BTC``).
+    """
+    return base_asset(symbol)
+
+
 def is_crypto_symbol(symbol: str) -> bool:
     """Best-effort heuristic: does ``symbol`` look like a crypto pair?
 
@@ -113,5 +123,6 @@ __all__ = [
     "canonical_crypto",
     "to_binance_perp",
     "to_bybit_perp",
+    "to_hyperliquid_coin",
     "is_crypto_symbol",
 ]
